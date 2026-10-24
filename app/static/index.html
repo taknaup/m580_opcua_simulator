@@ -30,6 +30,8 @@
     <button class="btn source" id="plcBtn" title="Connect to a PLC or PLC simulator over UMAS">
       <span class="dot" id="plcDot"></span><span id="plcLabel">PLC: off</span>
     </button>
+    <button class="btn" id="snapBtn" disabled title="Save and restore sets of tag values">Snapshots</button>
+    <button class="btn" id="diagBtn" title="OPC UA clients, PLC polling and server health">Diagnostics</button>
     <button class="btn" id="resetBtn" disabled>Reset values</button>
     <label class="btn primary" for="fileInput" id="loadLabel">Load program</label>
     <input type="file" id="fileInput" accept=".zef,.xef,.ZEF,.XEF" hidden>
@@ -92,6 +94,40 @@
       <div class="spacer" id="spacer"></div>
     </div>
   </div>
+  <section class="diag" id="diag" hidden aria-labelledby="diagTitle">
+    <div class="diag-head">
+      <button class="btn small" id="diagBack">← Tags</button>
+      <h2 id="diagTitle">Diagnostics</h2>
+      <span class="muted small" id="diagUpdated"></span>
+    </div>
+    <div class="tiles" id="diagTiles"></div>
+    <div class="diag-grid">
+      <article class="d-card" id="diagPlcCard">
+        <h3>PLC polling</h3>
+        <div id="diagPlc"></div>
+      </article>
+      <article class="d-card">
+        <h3>OPC UA clients</h3>
+        <div id="diagClients"></div>
+      </article>
+      <article class="d-card">
+        <h3>Server</h3>
+        <div id="diagServer"></div>
+      </article>
+    </div>
+  </section>
+  <aside class="detail" id="detail" hidden aria-labelledby="detailName">
+    <header class="d-head">
+      <div class="d-title">
+        <h2 id="detailName"></h2>
+        <div class="d-path mono" id="detailRoot"></div>
+      </div>
+      <button class="icon-btn" id="detailClose" title="Close (Esc)" aria-label="Close tag details">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      </button>
+    </header>
+    <div class="d-body" id="detailBody"></div>
+  </aside>
 </main>
 
 <dialog id="plcDialog">
@@ -113,10 +149,42 @@
   </form>
 </dialog>
 
+<dialog id="snapDialog" class="wide">
+  <h2>Value snapshots</h2>
+  <p class="hint">Save the current values to restore later, e.g. a test scenario. Applying writes only
+    writable tags whose value differs; in PLC mode the values are written to the PLC.</p>
+  <form id="snapForm" class="snap-save">
+    <label>Name<input id="snapName" maxlength="80" required placeholder="e.g. CDU2 pump fault" autocomplete="off"></label>
+    <fieldset class="snap-scope">
+      <legend>Tags</legend>
+      <label class="check"><input type="radio" name="snapScope" value="all" checked> <span id="snapAllLabel">All tags</span></label>
+      <label class="check"><input type="radio" name="snapScope" value="filter" id="snapFilterRadio"> <span id="snapFilterLabel">Tags shown by the current filter</span></label>
+    </fieldset>
+    <button type="submit" class="btn primary">Save snapshot</button>
+  </form>
+  <div class="snap-list-wrap">
+    <table class="snap-list">
+      <thead><tr><th>Name</th><th>Saved</th><th>Tags</th><th>From</th><th><span class="sr-only">Actions</span></th></tr></thead>
+      <tbody id="snapRows"></tbody>
+    </table>
+    <p class="muted small" id="snapEmpty" hidden>No snapshots yet.</p>
+  </div>
+  <div class="dlg-actions">
+    <label class="btn" for="snapImport">Import JSON</label>
+    <input type="file" id="snapImport" accept=".json,application/json" hidden>
+    <span class="spacer"></span>
+    <button type="button" class="btn" id="snapClose">Close</button>
+  </div>
+</dialog>
+
 <div class="dropzone" id="dropzone" hidden><div>Drop .ZEF / .XEF to load</div></div>
 <div class="busy" id="busy" hidden><div class="spinner"></div><div id="busyText">Loading…</div></div>
 <div class="toasts" id="toasts" aria-live="polite"></div>
 
 <script src="/static/app.js"></script>
+<script src="/static/chart.js"></script>
+<script src="/static/detail.js"></script>
+<script src="/static/snapshots.js"></script>
+<script src="/static/diagnostics.js"></script>
 </body>
 </html>

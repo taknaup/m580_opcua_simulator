@@ -13,12 +13,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .simulator import NotAvailable, PlcWriteFailed, Simulator, TagReadOnly, json_safe
+from .snapshots import SnapshotError
 from .xef_parser import ParseError
 
 log = logging.getLogger(__name__)
 STATIC = Path(__file__).parent / "static"
 PUSH_INTERVAL = 0.15
 MAX_UI_WATCH = 2000          # rows one browser may ask to keep fresh
+MAX_SNAPSHOT_BYTES = 20 * 2**20
 
 
 _HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.\-]{0,252})$|^\[?[0-9A-Fa-f:]+\]?$")
@@ -27,6 +29,11 @@ _HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.\-]{0,252})$|^\[?[0-9A-Fa-f:]+\]
 class WriteRequest(BaseModel):
     path: str
     value: object
+
+
+class SnapshotRequest(BaseModel):
+    name: str
+    paths: list[str] | None = None       # None: every tag
 
 
 class PlcRequest(BaseModel):
@@ -61,6 +68,16 @@ def create_app(sim: Simulator, max_upload_bytes: int) -> FastAPI:
     async def tags():
         return JSONResponse({"generation": sim.generation, "rows": sim.tag_rows(), "folders": sim.folders()})
 
+    @app.get("/api/diagnostics")
+    async def diagnostics():
+        return sim.diagnostics()
+
+    @app.get("/api/tag")
+    async def tag_detail(path: str):
+        if path not in sim.tags:
+            raise HTTPException(404, f"Unknown tag {path}")
+        return sim.tag_detail(path)
+
     @app.post("/api/tags/write")
     async def write(req: WriteRequest):
         try:
@@ -81,6 +98,55 @@ def create_app(sim: Simulator, max_upload_bytes: int) -> FastAPI:
             await sim.reset()
         except NotAvailable as e:
             raise HTTPException(409, str(e))
+        return {"ok": True}
+
+    # ---------------------------------------------------------------- snapshots
+    @app.get("/api/snapshots")
+    async def list_snapshots():
+        return sim.snapshots.list()
+
+    @app.post("/api/snapshots")
+    async def save_snapshot(req: SnapshotRequest):
+        try:
+            doc = sim.save_snapshot(req.name, req.paths)
+        except SnapshotError as e:
+            raise HTTPException(422, str(e))
+        return {k: v for k, v in doc.items() if k != "values"}
+
+    @app.post("/api/snapshots/import")
+    async def import_snapshot(file: UploadFile):
+        raw = await file.read(MAX_SNAPSHOT_BYTES + 1)
+        if len(raw) > MAX_SNAPSHOT_BYTES:
+            raise HTTPException(413, "Snapshot file too large")
+        try:
+            doc = sim.snapshots.import_doc(raw, sim.program.name if sim.program else "", sim.mode)
+        except SnapshotError as e:
+            raise HTTPException(422, str(e))
+        return {k: v for k, v in doc.items() if k != "values"}
+
+    @app.get("/api/snapshots/{snap_id}")
+    async def download_snapshot(snap_id: str):
+        try:
+            doc = sim.snapshots.load(snap_id)
+        except SnapshotError as e:
+            raise HTTPException(404, str(e))
+        return JSONResponse(doc, headers={"Content-Disposition": f'attachment; filename="{snap_id}.json"'})
+
+    @app.post("/api/snapshots/{snap_id}/apply")
+    async def apply_snapshot(snap_id: str):
+        try:
+            return await sim.apply_snapshot(snap_id)
+        except SnapshotError as e:
+            raise HTTPException(404, str(e))
+        except PlcWriteFailed as e:
+            raise HTTPException(502, str(e))
+
+    @app.delete("/api/snapshots/{snap_id}")
+    async def delete_snapshot(snap_id: str):
+        try:
+            sim.snapshots.delete(snap_id)
+        except SnapshotError as e:
+            raise HTTPException(404, str(e))
         return {"ok": True}
 
     @app.post("/api/plc")

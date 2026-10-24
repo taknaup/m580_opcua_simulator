@@ -12,6 +12,7 @@ import logging
 import re
 import struct
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -278,6 +279,13 @@ class PlcSource:
         self._pass_started = 0.0
         self._watch_key: frozenset | None = None
         self._watch_plan: list[ReadRequest] = []
+        # diagnostics
+        self.umas_stats = {"requests": 0, "errors": 0, "seconds": 0.0}
+        self.cycles: deque = deque(maxlen=180)    # (time, cycle s, watched reqs, background reqs)
+        self.connected_since: float | None = None
+        self.reconnects = 0
+        self.mast_ms: int | None = None
+        self.dictionary: dict = {}
         self._raw: dict[str, int] = {}             # EBOOL raw bytes from the last read
         self._written_at: dict[str, float] = {}    # path -> time of our last write to it
         self._hot: dict[str, float] = {}           # path -> time written (kept watched briefly)
@@ -314,9 +322,13 @@ class PlcSource:
         while not self._stop.is_set():
             try:
                 self._set_state("connecting")
-                self.client = UmasClient(self.host, self.port, self.unit)
+                self.client = UmasClient(self.host, self.port, self.unit, stats=self.umas_stats)
                 await self.client.connect()
+                self.mast_ms = await self.client.mast_period_ms()
                 await self._load_layout()
+                if self.connected_since is not None:
+                    self.reconnects += 1
+                self.connected_since = time.time()
                 backoff = 2.0
                 await self._poll_loop()
             except asyncio.CancelledError:
@@ -344,6 +356,7 @@ class PlcSource:
             try:
                 types, variables, members = _load_cache(cache)
                 log.info("Using cached PLC dictionary %s", cache.name)
+                self.dictionary = {"source": "cache", "seconds": 0.0}
             except Exception:
                 log.warning("Ignoring unreadable dictionary cache %s", cache.name)
         if types is None:
@@ -357,12 +370,15 @@ class PlcSource:
                     members[ty.type_id] = await c.read_members(ty.type_id)
             log.info("Read PLC dictionary: %d variables, %d types in %.1fs",
                      len(variables), len(types), time.time() - t)
+            self.dictionary = {"source": "PLC", "seconds": round(time.time() - t, 1)}
             try:
                 self.cache_dir.mkdir(parents=True, exist_ok=True)
                 _save_cache(cache, types, variables, members)
             except OSError as e:
                 log.warning("Could not cache PLC dictionary: %s", e)
         self.layout = Layout(project, types, variables, members)
+        self.dictionary.update(variables=len(variables), types=len(types), tags=len(self.layout.tags),
+                               project=project)
         self._background = plan_reads(self.layout.leaves.items(), c.max_request, c.chunk_size, GAP_MERGE)
         self._cursor, self._watch_key, self._watch_plan = 0, None, []
         self._pass_started = time.time()
@@ -427,6 +443,7 @@ class PlcSource:
         self.watched_requests, self.background_requests = len(plan), n_bg
         self.scan_time = time.time() - t0
         self.last_scan = time.time()
+        self.cycles.append((self.last_scan, round(self.scan_time, 3), len(plan), n_bg))
 
     async def _execute(self, req: ReadRequest, values: dict):
         t = time.time()
@@ -458,6 +475,35 @@ class PlcSource:
         self.last_scan = time.time()
         return values
 
+    async def read_now(self, paths: list[str]) -> dict[str, object]:
+        """Read the given tags right away (packed like watched tags)."""
+        if self.state != "connected" or not self.client:
+            raise UmasConnectionError(f"PLC {self.address} is not connected")
+        leaves = self.layout.leaves
+        values: dict[str, object] = {}
+        for req in plan_reads(((p, leaves[p]) for p in paths if p in leaves),
+                              self.client.max_request, self.client.chunk_size, WATCH_GAP):
+            await self._execute(req, values)
+        return values
+
+    async def write_many(self, items: list[tuple[str, object]]) -> int:
+        """Write many tags, packed into as few requests as possible (one PLC cycle each).
+
+        Values are not read back here; the tags stay watched for a while, so the next
+        cycles read what the PLC actually holds.
+        """
+        if self.state != "connected" or not self.client:
+            raise UmasConnectionError(f"PLC {self.address} is not connected")
+        now = time.time()
+        writes = []
+        for path, value in items:
+            leaf = self.layout.leaves[path]
+            writes.append((leaf.block, leaf.offset, self.layout.encode(leaf, value, self._raw.get(path))))
+            self._written_at[path] = self._hot[path] = now
+        for batch in plan_writes(writes, self.client.max_request):
+            await self.client.write_segments(batch)
+        return len(writes)
+
     async def write(self, path: str, value):
         """Write one tag and return the value read back from the PLC."""
         if self.state != "connected" or not self.client:
@@ -470,6 +516,23 @@ class PlcSource:
         if leaf.plc_type == "EBOOL":
             self._raw[path] = raw[0]
         return self.layout.decode(leaf, raw, 0)
+
+
+WRITE_REF_BYTES = 9     # block, address, length and flags of one write reference
+
+
+def plan_writes(items: list[tuple[int, int, bytes]], max_request: int) -> list[list[tuple[int, int, bytes]]]:
+    """Pack (block, address, data) writes into requests that fit in one frame."""
+    out: list[list] = []
+    size = 0
+    for item in items:
+        n = WRITE_REF_BYTES + len(item[2])
+        if not out or len(out[-1]) >= 255 or size + n > max_request:
+            out.append([])
+            size = REQ_HEADER
+        out[-1].append(item)
+        size += n
+    return out
 
 
 def _save_cache(path: Path, types, variables, members):

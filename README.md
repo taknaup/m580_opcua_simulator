@@ -191,6 +191,16 @@ other machines, change the router rule to e.g.
 - Click a column header to sort (again to reverse); default is Tag A→Z in natural order (`BRKR2` before `BRKR10`). In the tree, folders come first and items sort within each folder. Sorting by Value uses the values at the time of sorting; rows don't jump around as live values change
 - Filter by any words in the tag path, comment, parent comments or parent DDT type; by R/W or R/O; by type; or show only tags changed from their initial value. In the tree, filtering opens the folders that contain matches
 - Booleans are toggles; numbers and strings commit on Enter or when you leave the field (Esc cancels). Numeric fields accept IEC literals such as `16#FF`
+- **Tag detail panel**: click a tag (or focus its name and press Enter). It shows:
+  - the live value with an editor;
+  - a trend of recent changes (hover or arrow keys for values) and a table of them with who made each change;
+  - copyable NodeId and expanded NodeId, and the PLC → OPC UA data type;
+  - the number of subscriptions, the structure chain with DDT types and comments, and the comment prefix;
+  - the initial value (file mode) or PLC memory location (PLC mode).
+
+  The server keeps the last 240 changes per tag in memory. In PLC mode an open panel counts as watching the tag
+- **Snapshots**: save the current values of all tags, or of the tags the current filter shows, under a name. Apply one later to write back only writable tags whose value differs; R/O tags and tags missing from the program are skipped and reported. In PLC mode the snapshot's tags are read fresh from the PLC first, and changes are written in batches of up to ~70 per request. Snapshots can be downloaded and imported as JSON (`{"name": ..., "values": {"tag.path": value}}`) and are kept in the data volume
+- **Diagnostics** (`#diagnostics`): OPC UA clients (application, address, subscriptions, monitored items, publishing interval); PLC polling (state, reconnects, MAST period, dictionary, watched/background requests, UMAS request rate and timing, cycle-time chart); server (mode, uptime, memory, versions). Refreshes every 2 s
 - Values changed by the PLC, OPC UA clients or the UI appear live, with who changed them and when
 - **Reset values** (export mode) puts every tag back to the program's initial value
 

@@ -7,7 +7,9 @@ import asyncio
 import json
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 
 from asyncua import Client, ua
 
@@ -26,6 +28,19 @@ def http(method, path, body=None):
     req = urllib.request.Request(WEB + path, method=method,
                                  data=json.dumps(body).encode() if body is not None else None,
                                  headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def upload_json(path, doc):
+    boundary = uuid.uuid4().hex
+    body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"snap.json\"\r\n"
+            f"Content-Type: application/json\r\n\r\n").encode() + json.dumps(doc).encode() + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(WEB + path, method="POST", data=body,
+                                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             return r.status, json.loads(r.read())
@@ -110,6 +125,41 @@ async def main():
         check(status == 422, f"web write with bad value refused ({body.get('detail')})")
         status, _ = http("POST", "/api/tags/write", {"path": "HAC_RPP2_BRKR07.StsAlrt.Dly", "value": "16#FF"})
         check(status == 200 and await dly.read_value() == 255, "web write with IEC literal")
+
+        # ---------------- tag detail
+        st, d = http("GET", "/api/tag?path=" + urllib.parse.quote("HAC_RPP2_BRKR07.StsAlrt.Dly"))
+        check(st == 200 and d["nodeid"] == f"ns={ns};s=HAC_RPP2_BRKR07.StsAlrt.Dly", f"tag detail NodeId ({d.get('nodeid')})")
+        check([p["type"] for p in d["parents"]] == ["dev_BRKR_h01", "sfw_Alert_f02"], "tag detail structure chain with DDT types")
+        check([h[1:] for h in d["history"]][-2:] == [[12345, "opcua"], [255, "web"]], f"tag detail history ({d['history'][-2:]})")
+        check(http("GET", "/api/tag?path=nope")[0] == 404, "unknown tag detail is 404")
+
+        # ---------------- snapshots
+        paths = ["HAC_RPP2_BRKR07.StsAlrt.Dly", "HAC_RPP2_BRKR07.CntrlSel.ManCmd", "HAC_RPP2_BRKR07.OpnCmd"]
+        st, snap = http("POST", "/api/snapshots", {"name": "e2e scenario", "paths": paths})
+        check(st == 200 and snap["count"] == 3, "snapshot of 3 tags saved")
+        http("POST", "/api/tags/write", {"path": paths[0], "value": 111})
+        http("POST", "/api/tags/write", {"path": paths[1], "value": False})
+        st, r = http("POST", f"/api/snapshots/{snap['id']}/apply")
+        check(st == 200 and (r["written"], r["unchanged"], r["read_only"]) == (2, 0, 1),
+              f"snapshot apply writes changed R/W tags, skips R/O ({r})")
+        check(await dly.read_value() == 255 and await man.read_value() is True, "snapshot values back on OPC UA")
+        st, full = http("GET", f"/api/snapshots/{snap['id']}")
+        check(st == 200 and full["values"][paths[0]] == 255, "snapshot download has values")
+        st, imp = upload_json("/api/snapshots/import", {"name": "imported", "values": full["values"]})
+        check(st == 200 and imp["count"] == 3 and imp["note"] == "imported", "snapshot import")
+        check(upload_json("/api/snapshots/import", {"values": [1]})[0] == 422, "bad snapshot file rejected")
+        for sid in (snap["id"], imp["id"]):
+            http("DELETE", f"/api/snapshots/{sid}")
+        check(not [x for x in http("GET", "/api/snapshots")[1] if x["id"] in (snap["id"], imp["id"])], "snapshots deleted")
+
+        # ---------------- diagnostics
+        sub2 = await client.create_subscription(250, Handler())
+        await sub2.subscribe_data_change([dly, man])
+        diag = http("GET", "/api/diagnostics")[1]
+        mine = [c for c in diag["opcua"]["clients"] if c["monitored_items"] >= 2]
+        check(len(mine) >= 1 and 250 in mine[0]["publishing_ms"], f"diagnostics lists this client ({mine[:1]})")
+        check(diag["server"]["tags"] == 6050 and diag["plc"] is None, "diagnostics server section (export mode)")
+        await sub2.delete()
 
         sessions = http("GET", "/api/status")[1]["opcua"]["sessions"]
         check(sessions >= 1, f"status reports {sessions} OPC UA session(s)")

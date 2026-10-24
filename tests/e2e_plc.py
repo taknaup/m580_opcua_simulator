@@ -176,6 +176,7 @@ async def main():
 
             # ---------------- on-demand polling
             await on_demand_checks(client, n, direct)
+            await snapshot_and_diagnostics_checks(direct)
 
             # writes landing mid-scan must not bounce back to the old value
             bounces = 0
@@ -269,6 +270,23 @@ async def on_demand_checks(client, n, direct):
           f"cycle {s2['scan_time']}s, full refresh {s2['full_refresh']}s", flush=True)
     check(s2["watched"] >= len(paths), f"{len(paths)} subscribed tags are watched")
     await sub.delete()
+
+
+async def snapshot_and_diagnostics_checks(direct):
+    # values changed directly in the PLC (the server may not have polled them yet)
+    paths = [DLY, SP, MAN_AUTO]
+    st, snap = http("POST", "/api/snapshots", {"name": "e2e plc", "paths": paths})
+    saved = {p: (await direct.read(p)) for p in paths}
+    await direct.write(DLY, 30031)
+    await direct.write(SP, 47.25)
+    st, r = http("POST", f"/api/snapshots/{snap['id']}/apply")
+    check(st == 200 and r["written"] == 2 and r["unchanged"] == 1,
+          f"snapshot apply in PLC mode compares fresh PLC values ({r})")
+    check({p: await direct.read(p) for p in paths} == saved, "snapshot values landed in PLC memory")
+    http("DELETE", f"/api/snapshots/{snap['id']}")
+    d = http("GET", "/api/diagnostics")[1]["plc"]
+    check(d["state"] == "connected" and d["mast_ms"] == 100 and d["requests"] > 0 and d["cycles"],
+          f"diagnostics PLC section (MAST {d['mast_ms']} ms, {d['requests']} requests, avg {d['avg_request_ms']} ms)")
 
 
 async def relay_server(host, port):

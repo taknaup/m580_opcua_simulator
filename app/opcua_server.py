@@ -18,6 +18,22 @@ log = logging.getLogger(__name__)
 NAMESPACE_URI = "urn:m580-opcua-simulator:tags"
 
 
+# asyncua doesn't keep what a client said about itself at session creation; record it
+# (application and session name, time) for the diagnostics page.
+_orig_create_session = InternalSession.create_session
+
+
+async def _create_session(self, params, sockname=None):
+    desc = getattr(params, "ClientDescription", None)
+    self.client_app = desc.ApplicationName.Text if desc and desc.ApplicationName else ""
+    self.client_session_name = getattr(params, "SessionName", "") or ""
+    self.created_at = time.time()
+    return await _orig_create_session(self, params, sockname=sockname)
+
+
+InternalSession.create_session = _create_session
+
+
 class WriteRejected(Exception):
     """Raised by a write hook; carries the OPC UA status code to return to the client."""
 
@@ -325,6 +341,35 @@ class OpcUaServer:
                     and nid.Identifier in self._tags):
                 out.add(nid.Identifier)
         return out
+
+    def clients(self) -> list[dict]:
+        """Connected OPC UA clients with their subscriptions, for the diagnostics page."""
+        subs = list(self.server.iserver.subscription_service.subscriptions.values())
+        out = []
+        for proto in list(getattr(self.server.bserver, "clients", [])):
+            processor = getattr(proto, "processor", None)
+            session = getattr(processor, "session", None)
+            peer = proto.peer_name or ("?", 0)
+            mine = [x for x in subs if session is not None and x.session_id == session.session_id]
+            out.append({
+                "address": f"{peer[0]}:{peer[1]}",
+                "application": getattr(session, "client_app", "") if session else "",
+                "session": getattr(session, "client_session_name", "") if session else "",
+                "state": session.state.name if session else "no session",
+                "since": getattr(session, "created_at", None) if session else None,
+                "subscriptions": len(mine),
+                "monitored_items": sum(len(x.monitored_item_srv._monitored_items) for x in mine),
+                "publishing_ms": sorted({round(x.data.RevisedPublishingInterval) for x in mine}),
+            })
+        return out
+
+    def subscriber_count(self, path: str) -> int:
+        """Number of monitored items (across all clients) on one tag."""
+        try:
+            node = self.server.iserver.aspace[self.node_id(path)]
+            return len(node.attributes[ua.AttributeIds.Value].datachange_callbacks)
+        except KeyError:
+            return 0
 
     def read_paths(self, read_ttl: float = 60.0) -> set[str]:
         """Tags a client read in the last `read_ttl` seconds."""

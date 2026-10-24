@@ -39,6 +39,30 @@ function toast(msg, isErr = false) {
   setTimeout(() => el.remove(), isErr ? 6000 : 3000);
 }
 
+// Copy text to the clipboard. navigator.clipboard only exists on secure pages (HTTPS or
+// localhost); the UI is usually served over plain HTTP, so fall back to copying from a
+// hidden text field, which browsers allow during a click.
+async function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    try { await navigator.clipboard.writeText(text); return true; } catch { /* fall through */ }
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;";
+  // inside an open modal dialog only its own elements can take focus
+  (document.querySelector("dialog[open]") || document.body).appendChild(ta);
+  const prev = document.activeElement;
+  ta.focus();
+  ta.select();
+  ta.setSelectionRange(0, text.length);
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch { ok = false; }
+  ta.remove();
+  if (prev && prev.focus) prev.focus();
+  return ok;
+}
+
 async function api(url, opts = {}) {
   const res = await fetch(url, opts);
   let body = null;
@@ -79,6 +103,7 @@ async function refreshStatus() {
 
   $("resetBtn").hidden = plcMode;
   $("resetBtn").disabled = !p;
+  $("snapBtn").disabled = !p;
   $("loadLabel").textContent = plcMode ? (s.export ? "Replace comments file" : "Load comments file") : "Load program";
   $("loadLabel").title = plcMode
     ? "Optional .ZEF/.XEF: adds comments and applies R/O / R/W from them"
@@ -231,8 +256,9 @@ async function loadTags() {
   sel.replaceChildren(new Option("All types", ""), ...types.map((t) => new Option(t, t)));
   sel.value = types.includes(cur) ? cur : "";
   const has = state.rows.length > 0;
-  $("empty").hidden = has;
-  $("table").hidden = !has;
+  const diagOpen = document.body.classList.contains("diag-open");
+  $("empty").hidden = has || diagOpen;
+  $("table").hidden = !has || diagOpen;
   $("toolbar").hidden = !has;
   clearRendered();
   applyFilter();
@@ -504,6 +530,7 @@ function scheduleWatch() {
 function sendWatch(force = false) {
   if (!ws || ws.readyState !== 1) return;
   const paths = [...state.rendered.keys()].filter((k) => !k.startsWith("f:"));
+  if (state.detail) paths.push(state.detail.path);
   const sig = paths.join("\n");
   if (!force && sig === lastWatch) return;
   lastWatch = sig;
@@ -512,12 +539,15 @@ function sendWatch(force = false) {
 
 function buildRow(row, depth = -1) {
   const el = document.createElement("div");
-  el.className = "row";
+  el.className = "row" + (state.detail && state.detail.path === row[P] ? " selected" : "");
   el.dataset.path = row[P];
 
   const path = document.createElement("div");
   path.className = "cell c-path";
-  path.title = row[P];
+  path.title = `${row[P]} — click for details`;
+  path.tabIndex = 0;
+  path.setAttribute("role", "button");
+  path.setAttribute("aria-label", `Details for ${row[P]}`);
   const dot = row[P].search(/[.[]/);
   if (depth >= 0) {
     // tree leaf: just its own name, indented under its folder
@@ -642,6 +672,7 @@ function applyChange([path, value, source, ts]) {
   const row = state.byPath.get(path);
   if (!row) return;
   row[VAL] = value; row[SRC] = source; row[TS] = ts;
+  if (typeof detailOnChange === "function") detailOnChange(path, value, source, ts);
   const el = state.rendered.get(path);
   if (el) {
     fillValue(el, row);
@@ -744,8 +775,9 @@ $("resetBtn").addEventListener("click", async () => {
   catch (e) { toast(e.message, true); }
 });
 $("copyEp").addEventListener("click", async () => {
-  try { await navigator.clipboard.writeText($("endpoint").textContent); toast("Endpoint copied"); }
-  catch { toast("Copy failed — select the text instead", true); }
+  const text = $("endpoint").textContent;
+  if (await copyText(text)) toast("Endpoint copied");
+  else toast(`Copy failed — select the text instead: ${text}`, true);
 });
 $("plcBtn").addEventListener("click", openPlcDialog);
 $("plcForm").addEventListener("submit", connectPlc);

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import struct
+import time
 from dataclasses import dataclass, field
 
 log = logging.getLogger(__name__)
@@ -96,8 +97,10 @@ class UmasClient:
     """One TCP connection; requests are matched to replies by transaction id."""
 
     def __init__(self, host: str, port: int = 502, unit: int = 0, timeout: float = 5.0,
-                 max_in_flight: int = 4):
+                 max_in_flight: int = 4, stats: dict | None = None):
         self.host, self.port, self.unit, self.timeout = host, port, unit, timeout
+        # request counters; pass the same dict to successive clients to keep totals
+        self.stats = stats if stats is not None else {"requests": 0, "errors": 0, "seconds": 0.0}
         self.info = PlcInfo()
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
@@ -162,6 +165,8 @@ class UmasClient:
         if not self.connected:
             raise self._closed_exc or UmasConnectionError("not connected")
         async with self._slots:
+            started = time.perf_counter()
+            self.stats["requests"] += 1
             self._tid = (self._tid + 1) & 0xFFFF
             tid = self._tid
             pdu = bytes([UMAS_FC, 0x00, func]) + payload
@@ -172,7 +177,14 @@ class UmasClient:
                 reply = await asyncio.wait_for(fut, self.timeout)
             except asyncio.TimeoutError:
                 self._pending.pop(tid, None)
+                self.stats["errors"] += 1
                 raise UmasConnectionError(f"no reply to UMAS function 0x{func:02X}") from None
+            except UmasError:
+                self.stats["errors"] += 1
+                raise
+            self.stats["seconds"] += time.perf_counter() - started
+        if reply[0] & 0x80 or len(reply) < 3 or reply[0] != UMAS_FC or reply[2] != OK:
+            self.stats["errors"] += 1
         if reply[0] & 0x80:
             raise UmasError(f"Modbus exception {reply[1] if len(reply) > 1 else '?'} for UMAS 0x{func:02X}")
         if len(reply) < 3 or reply[0] != UMAS_FC:
@@ -206,6 +218,13 @@ class UmasClient:
         r.u16(); r.u16()
         self.info.index = r.u8()
         self.info.hardware_id = r.u32()
+
+    async def mast_period_ms(self) -> int | None:
+        """%SW0: MAST task period in ms (0 = cyclic), from the system words block."""
+        try:
+            return struct.unpack("<h", await self.read_bytes(0x2B, 80, 2))[0]
+        except UmasError:
+            return None
 
     async def project_name(self) -> str:
         """Application name; it ends the project-info reply as a length-prefixed C string."""
@@ -289,6 +308,11 @@ class UmasClient:
         if len(data) < want:
             raise UmasError(f"short read: {len(data)} of {want} bytes for {len(segments)} ranges")
         return data[:want]
+
+    async def write_segments(self, items: list[tuple[int, int, bytes]]):
+        """Write several (block, address, data) ranges in one request."""
+        refs = b"".join(struct.pack("<BHIH", 0x11, b, a, len(d)) + d for b, a, d in items)
+        await self.request(F_WRITE_VARIABLES, struct.pack("<IB", self.info.crc, len(items)) + refs)
 
     async def write_bytes(self, block: int, address: int, data: bytes):
         ref = struct.pack("<BHIH", 0x11, block, address, len(data)) + data

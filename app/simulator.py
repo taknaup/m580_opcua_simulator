@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import time
+from collections import deque
 from pathlib import Path
 
 from asyncua import ua
@@ -19,10 +20,15 @@ from asyncua import ua
 from .iec_values import coerce
 from .opcua_server import OpcUaServer, WriteRejected
 from .plc_source import Layout, PlcSource
+from .snapshots import SnapshotError, SnapshotStore
 from .umas import UmasConnectionError, UmasError
 from .xef_parser import Program, Tag, parse_program
 
 log = logging.getLogger(__name__)
+
+
+HISTORY_PER_TAG = 240        # recent changes kept per tag for the detail panel
+SAME_CHANGE_SECONDS = 3.0    # same value again within this time is the same change
 
 
 def json_safe(v):
@@ -52,6 +58,7 @@ class Simulator:
         self.update_period = update_period
         self.ui_watch: dict[int, set[str]] = {}    # web UI connection -> tags on screen
         self.watch_stats: dict[str, int] = {}
+        self.started = time.time()
         self.mode = "export"
         self.export: Program | None = None        # last uploaded .ZEF/.XEF
         self.program: Program | None = None       # what is being served
@@ -63,6 +70,8 @@ class Simulator:
         self.values: dict[str, object] = {}
         self.changed_at: dict[str, float] = {}
         self.sources: dict[str, str] = {}
+        self.history: dict[str, deque] = {}        # path -> recent (time, value, source)
+        self.snapshots = SnapshotStore(data_dir / "snapshots")
         self.generation = 0          # bumps whenever the tag set or its metadata changes
         self.loading = False         # startup program load in progress
         self._listeners: set = set()
@@ -88,6 +97,9 @@ class Simulator:
 
     def _reloaded(self):
         self.generation += 1
+        # keep history only for tags that still exist
+        for path in [p for p in self.history if p not in self.tags]:
+            del self.history[path]
         self._notify({"type": "reload", "generation": self.generation})
 
     def _record(self, path: str, value, source: str, now: float | None = None):
@@ -95,6 +107,15 @@ class Simulator:
         self.values[path] = value
         self.changed_at[path] = now
         self.sources[path] = source
+        h = self.history.get(path)
+        if h is None:
+            h = self.history[path] = deque(maxlen=HISTORY_PER_TAG)
+        if h and h[-1][1] == value and now - h[-1][0] < SAME_CHANGE_SECONDS:
+            # the PLC poll saw a write before the writer recorded it: one change, keep the writer
+            if h[-1][2] == "plc":
+                h[-1] = (h[-1][0], value, source)
+        else:
+            h.append((now, value, source))
         self._notify({"type": "value", "path": path, "value": json_safe(value), "source": source, "ts": now})
 
     # ---------------------------------------------------------------- export files
@@ -326,6 +347,57 @@ class Simulator:
                     await self.opcua.publish(tag.path, tag.initial)
                     self._record(tag.path, tag.initial, "reset")
 
+    # ---------------------------------------------------------------- snapshots
+    def save_snapshot(self, name: str, paths: list[str] | None = None) -> dict:
+        if not self.tags:
+            raise SnapshotError("No tags loaded")
+        chosen = self.tags if paths is None else [p for p in paths if p in self.tags]
+        if not chosen:
+            raise SnapshotError("None of the given tags exist")
+        values = {p: json_safe(self.values[p]) for p in chosen}
+        return self.snapshots.save(name, values, self.program.name if self.program else "", self.mode)
+
+    async def apply_snapshot(self, snap_id: str) -> dict:
+        """Write a snapshot's values; only writable tags whose value differs are written.
+
+        In PLC mode the snapshot's tags are read from the PLC first, so "differs" is
+        judged against what the PLC holds now, not the last poll.
+        """
+        doc = self.snapshots.load(snap_id)
+        result = {"name": doc["name"], "written": 0, "unchanged": 0, "read_only": 0, "missing": 0, "invalid": 0}
+        wanted: dict[str, object] = {}
+        for path, raw in doc["values"].items():
+            tag = self.tags.get(path)
+            if tag is None:
+                result["missing"] += 1
+            elif not tag.writable:
+                result["read_only"] += 1
+            else:
+                try:
+                    wanted[path] = coerce(raw, tag.ti)
+                except (ValueError, TypeError):
+                    result["invalid"] += 1
+        try:
+            current = await self.plc.read_now(list(wanted)) if self.mode == "plc" else self.values
+            todo = [(p, v) for p, v in wanted.items() if current.get(p) != v]
+            if todo and self.mode == "plc":
+                await self.plc.write_many(todo)
+        except UmasConnectionError as e:
+            raise PlcWriteFailed(f"PLC not connected: {e}") from e
+        except UmasError as e:
+            raise PlcWriteFailed(f"PLC rejected the write: {e}") from e
+        result["unchanged"] = len(wanted) - len(todo)
+        async with self._lock:
+            now = time.time()
+            for i, (path, value) in enumerate(todo):
+                await self.opcua.publish(path, value)
+                self._record(path, value, "snapshot", now)
+                if i % 500 == 499:
+                    await asyncio.sleep(0)
+        result["written"] = len(todo)
+        log.info("Applied snapshot %s: %s", doc["name"], result)
+        return result
+
     def _client_wrote(self, path: str, value):
         if path in self.tags:
             self._record(path, value, "opcua")
@@ -372,6 +444,85 @@ class Simulator:
                       "namespace_index": self.opcua.ns, "root": p.name if p else None},
             "default_access": "R/W" if self.default_writable else "R/O",
         }
+
+    def tag_detail(self, path: str) -> dict:
+        """Everything about one tag, for the web UI's detail panel."""
+        tag = self.tags[path]
+        p = self.program
+        from .opcua_server import NAMESPACE_URI, _prefixes, _split_path
+        parents = [{"path": pre, "name": _split_path(pre)[-1],
+                    "type": p.struct_types.get(pre, ""), "comment": p.struct_comments.get(pre, "")}
+                   for pre in _prefixes(path)]
+        plc = None
+        if self.mode == "plc" and self.layout and path in self.layout.leaves:
+            leaf = self.layout.leaves[path]
+            plc = {"block": leaf.block, "offset": leaf.offset, "size": leaf.size, "type": leaf.plc_type,
+                   "watched": bool(self.plc and path in (self.plc._watch_key or ()))}
+        return {
+            "path": path, "name": _split_path(path)[-1],
+            "nodeid": f"ns={self.opcua.ns};s={path}", "nodeid_expanded": f"nsu={NAMESPACE_URI};s={path}",
+            "type": tag.type_name, "ua_type": tag.ti.ua_type, "writable": tag.writable, "access": tag.access,
+            "comment": tag.comment, "address": tag.address, "initial": json_safe(tag.initial),
+            "value": json_safe(self.values.get(path)), "changed_at": self.changed_at.get(path),
+            "source": self.sources.get(path), "parents": parents, "plc": plc,
+            "subscribers": self.opcua.subscriber_count(path),
+            "history": [[t, json_safe(v), s] for t, v, s in self.history.get(path, ())],
+        }
+
+    def diagnostics(self) -> dict:
+        import importlib.metadata
+        import platform
+        p = self.program
+        rss = None
+        try:
+            for line in Path("/proc/self/status").read_text().splitlines():
+                if line.startswith("VmRSS:"):
+                    rss = round(int(line.split()[1]) / 1024, 1)
+        except OSError:
+            pass
+        clients = self.opcua.clients()
+        out = {
+            "now": time.time(),
+            "server": {
+                "started": self.started, "mode": self.mode, "program": p.name if p else None,
+                "file": self.export.source_file if self.export else None,
+                "tags": len(self.tags), "memory_mb": rss,
+                "history_entries": sum(len(h) for h in self.history.values()),
+                "snapshots": len(self.snapshots.list()),
+                "web_clients": len(self._listeners),
+                "versions": {"python": platform.python_version(),
+                             "asyncua": importlib.metadata.version("asyncua")},
+            },
+            "opcua": {
+                "port": self.opcua.port, "clients": clients,
+                "subscriptions": sum(c["subscriptions"] for c in clients),
+                "monitored_items": sum(c["monitored_items"] for c in clients),
+                "subscribed_tags": len(self.opcua.subscribed_paths()),
+                "recently_read_tags": len(self.opcua.read_paths()),
+            },
+            "plc": None,
+        }
+        src = self.plc
+        if src:
+            st = src.umas_stats
+            recent = list(src.cycles)[-30:]
+            span = recent[-1][0] - recent[0][0] + recent[0][1] if len(recent) > 1 else 0
+            out["plc"] = {
+                "host": src.host, "port": src.port, "unit": src.unit, "state": src.state, "error": src.error,
+                "connected_since": src.connected_since, "reconnects": src.reconnects,
+                "plc_name": src.client.info.hostname if src.client else "",
+                "max_frame": src.client.info.max_frame if src.client else None,
+                "crc": f"{src.crc:08x}" if src.crc else None, "mast_ms": src.mast_ms,
+                "dictionary": src.dictionary, "update_period": src.update_period,
+                "cycle": round(src.scan_time, 2), "watched": src.watched_count, "watched_by": self.watch_stats,
+                "watched_requests": src.watched_requests, "background_requests": src.background_requests,
+                "full_refresh": round(src.full_refresh, 1),
+                "requests": st["requests"], "errors": st["errors"],
+                "avg_request_ms": round(1000 * st["seconds"] / st["requests"], 1) if st["requests"] else None,
+                "requests_per_s": round(sum(c[2] + c[3] for c in recent) / span, 1) if span else None,
+                "cycles": [[t, c, w, b] for t, c, w, b in src.cycles],
+            }
+        return out
 
     def folders(self) -> dict[str, list[str]]:
         """Structure/array paths -> [type name, comment], for the UI tree."""
