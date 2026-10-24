@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# local runtime data (uploaded files, cached PLC dictionaries)
+data/
+
+# Control Expert project files: they can hold credentials (e.g. in the project
+# header comment). Keep them out of the repository; tests skip when absent.
+*.ZEF
+*.zef
+*.XEF
+*.xef

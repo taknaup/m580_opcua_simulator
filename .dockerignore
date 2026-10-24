@@ -1,0 +1,9 @@
+data/
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+*.ZEF
+*.zef
+*.XEF
+*.xef

@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M580 OPC UA Simulator</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='3' y='6' width='26' height='20' rx='3' fill='%233d9a6b'/%3E%3Crect x='7' y='10' width='4' height='12' rx='1' fill='%23fff'/%3E%3Crect x='14' y='10' width='4' height='12' rx='1' fill='%23fff' opacity='.7'/%3E%3Crect x='21' y='10' width='4' height='12' rx='1' fill='%23fff' opacity='.45'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true"></span>
+    <div>
+      <h1>M580 OPC UA Simulator</h1>
+      <div class="project" id="project">No program loaded</div>
+    </div>
+  </div>
+  <div class="server">
+    <div class="endpoint" title="OPC UA endpoint">
+      <span class="dot" id="sessDot"></span>
+      <code id="endpoint">opc.tcp://…:4840</code>
+      <button class="icon-btn" id="copyEp" title="Copy endpoint URL" aria-label="Copy endpoint URL">
+        <svg viewBox="0 0 24 24" width="16" height="16"><rect x="8" y="8" width="12" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" fill="none" stroke="currentColor" stroke-width="2"/></svg>
+      </button>
+    </div>
+    <div class="meta"><span id="sessions">0 clients</span> · <span id="wsState" class="ws-off">offline</span></div>
+  </div>
+  <div class="actions">
+    <button class="btn source" id="plcBtn" title="Connect to a PLC or PLC simulator over UMAS">
+      <span class="dot" id="plcDot"></span><span id="plcLabel">PLC: off</span>
+    </button>
+    <button class="btn" id="resetBtn" disabled>Reset values</button>
+    <label class="btn primary" for="fileInput" id="loadLabel">Load program</label>
+    <input type="file" id="fileInput" accept=".zef,.xef,.ZEF,.XEF" hidden>
+  </div>
+</header>
+
+<div class="banner" id="plcBanner" hidden></div>
+<div class="banner info" id="overlayBanner" hidden>
+  <span id="overlayText"></span>
+  <button class="link" id="removeExport">Remove file</button>
+</div>
+
+<div class="warnings" id="warnings" hidden>
+  <button class="link" id="warnToggle"></button>
+  <ul id="warnList" hidden></ul>
+</div>
+
+<section class="toolbar" id="toolbar" hidden>
+  <div class="seg" role="radiogroup" aria-label="View" id="viewSeg">
+    <button role="radio" aria-checked="true" data-v="table">Table</button>
+    <button role="radio" aria-checked="false" data-v="tree">Tree</button>
+  </div>
+  <div class="search">
+    <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="2"/><path d="m20 20-4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    <input id="search" type="search" placeholder="Filter by tag name or comment…" autocomplete="off" spellcheck="false">
+  </div>
+  <div class="seg" role="radiogroup" aria-label="Access filter" id="accessSeg">
+    <button role="radio" aria-checked="true" data-v="all">All</button>
+    <button role="radio" aria-checked="false" data-v="rw">R/W</button>
+    <button role="radio" aria-checked="false" data-v="ro">R/O</button>
+  </div>
+  <select id="typeSel" aria-label="Type filter"><option value="">All types</option></select>
+  <label class="check"><input type="checkbox" id="changedOnly"> Changed</label>
+  <div class="tree-tools" id="treeTools" hidden>
+    <button class="btn small" id="expandAll" title="Expand all folders">Expand all</button>
+    <button class="btn small" id="collapseAll" title="Collapse all folders">Collapse all</button>
+  </div>
+  <span class="count" id="count"></span>
+</section>
+
+<main id="main">
+  <div class="empty" id="empty">
+    <div class="drop-card">
+      <svg viewBox="0 0 48 48" width="44" height="44" aria-hidden="true"><path d="M24 30V10m0 0-7 7m7-7 7 7" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><path d="M8 30v6a4 4 0 0 0 4 4h24a4 4 0 0 0 4-4v-6" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"/></svg>
+      <h2 id="emptyTitle">Load a Control Expert program</h2>
+      <p id="emptyText">Drop a <b>.ZEF</b> or <b>.XEF</b> export here, or use <b>Load program</b>.<br>
+        Variables with <i>HMI</i> exposure are served over OPC UA.<br>
+        Or use <b>PLC</b> to serve live values from a PLC simulator.</p>
+    </div>
+  </div>
+  <div class="table" id="table" hidden>
+    <div class="thead" id="thead">
+      <div data-col="tag"><button class="sort"><span id="thName">Tag</span><span class="arrow" aria-hidden="true"></span></button></div>
+      <div data-col="type"><button class="sort">Type<span class="arrow" aria-hidden="true"></span></button></div>
+      <div data-col="value"><button class="sort">Value<span class="arrow" aria-hidden="true"></span></button></div>
+      <div data-col="access"><button class="sort">Access<span class="arrow" aria-hidden="true"></span></button></div>
+      <div data-col="comment"><button class="sort">Comment<span class="arrow" aria-hidden="true"></span></button></div>
+    </div>
+    <div class="scroller" id="scroller">
+      <div class="spacer" id="spacer"></div>
+    </div>
+  </div>
+</main>
+
+<dialog id="plcDialog">
+  <form method="dialog" id="plcForm">
+    <h2>PLC connection (UMAS)</h2>
+    <p class="hint">Serves the PLC's data dictionary (HMI variables) live. All tags are writable
+      until a .ZEF/.XEF is loaded; its comments then set R/O and R/W.</p>
+    <label>Host or IP<input id="plcHost" required placeholder="192.168.0.128" autocomplete="off" spellcheck="false"></label>
+    <div class="row2">
+      <label>Port<input id="plcPort" type="number" min="1" max="65535" value="502"></label>
+      <label>Unit ID<input id="plcUnit" type="number" min="0" max="255" value="1"></label>
+    </div>
+    <div class="dlg-actions">
+      <button type="button" class="btn danger" id="plcDisconnect">Disconnect</button>
+      <span class="spacer"></span>
+      <button type="button" class="btn" id="plcCancel">Cancel</button>
+      <button type="submit" class="btn primary" id="plcConnect">Connect</button>
+    </div>
+  </form>
+</dialog>
+
+<div class="dropzone" id="dropzone" hidden><div>Drop .ZEF / .XEF to load</div></div>
+<div class="busy" id="busy" hidden><div class="spinner"></div><div id="busyText">Loading…</div></div>
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

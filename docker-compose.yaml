@@ -1,0 +1,82 @@
+# M580 OPC UA simulator behind a Traefik reverse proxy
+#   Web UI : http://opcua-sim.localtest.me      (Traefik entrypoint "web", :80)
+#   OPC UA : opc.tcp://<host>:4840              (Traefik TCP entrypoint "opcua", :4840)
+#
+# Packaged deployment (new machine, no Traefik yet) - starts Traefik and the simulator:
+#   docker compose --profile traefik up -d --build
+#
+# Machine that already runs Traefik on the "proxy" network with an "opcua" entrypoint
+# (e.g. /home/scada/Documents/docker-compose_traefik.yaml) - simulator only:
+#   docker compose up -d --build
+name: opcua-sim
+
+services:
+  traefik:
+    profiles: ["traefik"]
+    image: traefik:v3.7
+    container_name: traefik
+    restart: unless-stopped
+    command:
+      - "--api.insecure=true"                       # dashboard on :8080
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false" # only containers with traefik.enable=true
+      - "--providers.docker.network=proxy"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.opcua.address=:4840"
+    ports:
+      - "80:80"
+      - "8080:8080"
+      - "4840:4840"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dashboard.rule=Host(`traefik.localtest.me`)"
+      - "traefik.http.routers.dashboard.entrypoints=web"
+      - "traefik.http.routers.dashboard.service=api@internal"
+    networks:
+      - proxy
+
+  opcua-sim:
+    build: .
+    image: m580-opcua-sim:latest
+    container_name: opcua-sim
+    restart: unless-stopped
+    environment:
+      DEFAULT_ACCESS: "RW"        # access for comments without an R/O or R/W prefix
+      # Default: serve the uploaded .ZEF/.XEF file. AUTOCONNECT "true" connects to the
+      # PLC / Control Expert PLC simulator at PLC_HOST over UMAS at startup instead.
+      # PLC_HOST also pre-fills the PLC dialog in the web UI.
+      AUTOCONNECT: "false"
+      PLC_HOST: "192.168.0.128"
+      PLC_PORT: "502"
+      PLC_UNIT: "1"
+      PLC_POLL_INTERVAL: "0.5"    # pause between full scans, seconds
+      OPCUA_SERVER_NAME: "M580 OPC UA Simulator"
+      MAX_UPLOAD_MB: "100"
+    volumes:
+      - opcua-sim-data:/data      # last uploaded file and cached PLC dictionaries
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+      # web UI
+      - "traefik.http.routers.opcua-sim.rule=Host(`opcua-sim.localtest.me`)"
+      - "traefik.http.routers.opcua-sim.entrypoints=web"
+      - "traefik.http.routers.opcua-sim.service=opcua-sim-web"
+      - "traefik.http.services.opcua-sim-web.loadbalancer.server.port=8000"
+      # OPC UA binary (raw TCP passthrough)
+      - "traefik.tcp.routers.opcua-sim.rule=HostSNI(`*`)"
+      - "traefik.tcp.routers.opcua-sim.entrypoints=opcua"
+      - "traefik.tcp.routers.opcua-sim.service=opcua-sim-opcua"
+      - "traefik.tcp.services.opcua-sim-opcua.loadbalancer.server.port=4840"
+    networks:
+      - proxy
+
+volumes:
+  opcua-sim-data:
+
+networks:
+  # Created by this file on a new machine. Where another project already created a
+  # network named "proxy", Compose reuses it (with a warning) and never removes it.
+  proxy:
+    name: proxy
