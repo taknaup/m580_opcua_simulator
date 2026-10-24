@@ -9,6 +9,9 @@ from typing import Awaitable, Callable
 
 from asyncua import Server, ua
 from asyncua.server.internal_session import InternalSession
+from asyncua.server.uaprocessor import UaProcessor
+
+from . import pki as pki_mod
 
 from .iec_values import coerce
 from .xef_parser import Program, Tag
@@ -33,6 +36,21 @@ async def _create_session(self, params, sockname=None):
 
 InternalSession.create_session = _create_session
 
+APP_URI = "urn:m580-opcua-simulator"
+
+# Note each request's channel security (policy URI, mode) so the certificate validator,
+# which asyncua calls without it, can skip unencrypted channels.
+_orig_process_message = UaProcessor._process_message
+
+
+async def _process_message(self, typeid, requesthdr, seqhdr, body):
+    policy = self._connection.security_policy
+    pki_mod.channel_security.set((policy.URI, int(getattr(policy, "Mode", 1) or 1)))
+    return await _orig_process_message(self, typeid, requesthdr, seqhdr, body)
+
+
+UaProcessor._process_message = _process_message
+
 
 class WriteRejected(Exception):
     """Raised by a write hook; carries the OPC UA status code to return to the client."""
@@ -51,9 +69,12 @@ class OpcUaServer:
     """
 
     def __init__(self, host: str, port: int, server_name: str,
-                 on_client_write: Callable[[str, object], None]):
+                 on_client_write: Callable[[str, object], None],
+                 security: list[str] | None = None, pki: "pki_mod.Pki | None" = None):
         self.endpoint = f"opc.tcp://{host}:{port}/"
         self.port = port
+        self.security = security or ["None"]       # policy names, see pki.POLICIES
+        self.pki = pki
         self.server_name = server_name
         self.on_client_write = on_client_write
         self.write_hook: Callable[[str, object], Awaitable[object]] | None = None
@@ -72,8 +93,14 @@ class OpcUaServer:
         await self.server.init()
         self.server.set_endpoint(self.endpoint)
         self.server.set_server_name(self.server_name)
-        await self.server.set_application_uri("urn:m580-opcua-simulator")
-        self.server.set_security_policy([ua.SecurityPolicyType.NoSecurity])
+        await self.server.set_application_uri(APP_URI)
+        if self.pki is not None and any(p != "None" for p in self.security):
+            await asyncio.to_thread(self.pki.ensure_server_cert)
+            await self.server.load_certificate(str(self.pki.cert_path))
+            await self.server.load_private_key(str(self.pki.key_path))
+            self.server.set_certificate_validator(self.pki.validate)
+        self.server.set_security_policy([pki_mod.POLICIES[p] for p in self.security],
+                                        permission_ruleset=pki_mod.SimulatorRuleset())
         self.ns = await self.server.register_namespace(NAMESPACE_URI)
 
         attr_service = self.server.iserver.attribute_service
@@ -82,7 +109,7 @@ class OpcUaServer:
         self._orig_read = attr_service.read
         attr_service.read = self._tracked_read
         await self.server.start()
-        log.info("OPC UA server listening on %s", self.endpoint)
+        log.info("OPC UA server listening on %s (security: %s)", self.endpoint, ", ".join(self.security))
 
     async def stop(self):
         await self.server.stop()
@@ -351,7 +378,11 @@ class OpcUaServer:
             session = getattr(processor, "session", None)
             peer = proto.peer_name or ("?", 0)
             mine = [x for x in subs if session is not None and x.session_id == session.session_id]
+            policy = getattr(getattr(processor, "_connection", None), "security_policy", None)
+            mode = int(getattr(policy, "Mode", 1) or 1) if policy is not None else 1
             out.append({
+                "security": (policy.URI.rsplit("#", 1)[-1] if policy is not None else "None")
+                            + {2: " · Sign", 3: " · Sign & Encrypt"}.get(mode, ""),
                 "address": f"{peer[0]}:{peer[1]}",
                 "application": getattr(session, "client_app", "") if session else "",
                 "session": getattr(session, "client_session_name", "") if session else "",

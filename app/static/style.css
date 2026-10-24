@@ -331,6 +331,15 @@ dialog label.btn { flex-direction: row; margin: 0; flex: none; color: var(--text
 .diag td { padding: 5px 8px 5px 0; border-bottom: 1px solid var(--line); vertical-align: top; font-variant-numeric: tabular-nums; }
 .diag .d-chart { margin: 4px 0 10px; }
 .state-ok { color: var(--on); font-weight: 600; }
+.diag-wide { grid-column: 1 / -1; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { font-family: var(--mono); font-size: 11.5px; padding: 2px 8px; border-radius: 99px; background: var(--rw-soft); color: var(--rw); }
+.chip.off { background: var(--ro-soft); color: var(--ro); }
+.badge.trusted { background: var(--accent-soft); color: var(--accent); }
+.badge.auto { background: var(--rw-soft); color: var(--rw); }
+.badge.rejected { background: color-mix(in srgb, var(--danger) 14%, var(--panel)); color: var(--danger); }
+.cert-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.sec-sub { margin: 12px 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); }
 .state-bad { color: var(--danger); font-weight: 600; }
 body.diag-open .toolbar, body.diag-open #warnings, body.diag-open #overlayBanner { display: none; }
 a.btn { text-decoration: none; color: inherit; }

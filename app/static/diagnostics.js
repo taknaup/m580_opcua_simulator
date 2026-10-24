@@ -51,8 +51,11 @@ function showDiagnostics(open) {
 }
 
 async function refreshDiagnostics() {
-  let d;
-  try { d = await api("/api/diagnostics"); } catch (e) { $("diagUpdated").textContent = `update failed: ${e.message}`; return; }
+  let d, sec;
+  try {
+    [d, sec] = await Promise.all([api("/api/diagnostics"), api("/api/security")]);
+  } catch (e) { $("diagUpdated").textContent = `update failed: ${e.message}`; return; }
+  renderSecurity(sec);
   const plc = d.plc, ua = d.opcua, srv = d.server;
   $("diagUpdated").textContent = `updated ${clockTime(d.now)}`;
 
@@ -117,7 +120,7 @@ async function refreshDiagnostics() {
   } else {
     const t = el("table");
     const hr = el("tr");
-    for (const h of ["Client", "Address", "Connected", "Subscribed", "Publishing"]) hr.append(el("th", null, h));
+    for (const h of ["Client", "Address", "Security", "Connected", "Subscribed", "Publishing"]) hr.append(el("th", null, h));
     const thead = el("thead"); thead.append(hr);
     const tb = el("tbody");
     for (const c of ua.clients) {
@@ -125,7 +128,7 @@ async function refreshDiagnostics() {
       const who = el("td");
       who.append(el("div", null, c.application || "(no name)"));
       if (c.session) who.append(el("div", "muted small", c.session));
-      tr.append(who, el("td", "mono", c.address),
+      tr.append(who, el("td", "mono", c.address), el("td", null, c.security || "None"),
         el("td", null, c.since ? duration(d.now - c.since) : c.state),
         el("td", null, `${c.monitored_items.toLocaleString()} in ${c.subscriptions}`),
         el("td", null, c.publishing_ms.length ? c.publishing_ms.map((m) => `${m} ms`).join(", ") : "—"));
@@ -149,6 +152,115 @@ async function refreshDiagnostics() {
     ["Snapshots", String(srv.snapshots)],
     ["Versions", `Python ${srv.versions.python}, asyncua ${srv.versions.asyncua}`],
   ]));
+}
+
+// ------------------------------------------------------------------ OPC UA security
+const TRUST_LABEL = { trusted: "Trusted", auto: "Accepted", rejected: "Rejected" };
+
+function renderSecurity(sec) {
+  const box = $("diagSecurity");
+  box.replaceChildren();
+  const offered = new Set(sec.policies);
+  const chips = el("div", "chips");
+  for (const p of ["None", "Basic256Sha256_Sign", "Basic256Sha256_SignAndEncrypt", "Aes128Sha256RsaOaep_Sign",
+    "Aes128Sha256RsaOaep_SignAndEncrypt", "Aes256Sha256RsaPss_Sign", "Aes256Sha256RsaPss_SignAndEncrypt"]) {
+    const c = el("span", "chip" + (offered.has(p) ? "" : " off"), p.replace("_SignAndEncrypt", " · Sign & Encrypt").replace("_Sign", " · Sign"));
+    c.title = offered.has(p) ? "Offered" : "Not offered (OPCUA_SECURITY)";
+    chips.append(c);
+  }
+  const rows = [["Policies", chips]];
+  if (sec.client_certs) {
+    rows.push(["Client certificates", sec.client_certs === "trusted"
+      ? "Trusted only — unknown certificates are rejected until trusted below"
+      : "Accept any valid certificate (OPCUA_CLIENT_CERTS=accept); reject individual ones below"]);
+  }
+  const sc = sec.server_certificate;
+  if (sc) {
+    const thumb = el("span");
+    thumb.append(el("span", "mono", sc.thumbprint), copyButton(sc.thumbprint, "Thumbprint"));
+    const dl = el("span", "cert-actions");
+    for (const fmt of ["der", "pem"]) {
+      const a = el("a", "btn small", `Download .${fmt}`);
+      a.href = `/api/security/server-cert.${fmt}`;
+      dl.append(a);
+    }
+    rows.push(
+      ["Server certificate", `${sc.subject} · RSA ${sc.key_bits} · valid until ${new Date(sc.valid_to * 1000).toLocaleDateString()}`],
+      ["Thumbprint (SHA-1)", thumb],
+      ["Application URI", sc.application_uri],
+      ["Host names", [...sc.dns, ...sc.ip].join(", ")],
+      ["", dl],
+    );
+  } else {
+    rows.push(["Server certificate", "none — only the None policy is offered"]);
+  }
+  box.append(kv(rows));
+  if (!sc) return;
+
+  box.append(el("p", "sec-sub", "Client certificates"));
+  if (!sec.clients.length) {
+    box.append(el("p", "muted small", "No client has connected with a signed or encrypted channel yet."));
+    return;
+  }
+  const t = el("table");
+  const hr = el("tr");
+  for (const h of ["Client", "Thumbprint", "Status", "Last connection", ""]) hr.append(el("th", null, h));
+  const thead = el("thead"); thead.append(hr);
+  const tb = el("tbody");
+  for (const c of sec.clients) {
+    const tr = el("tr");
+    const who = el("td");
+    who.append(el("div", null, c.application || c.subject));
+    who.append(el("div", "muted small", c.application_uri || c.certificate_uri || ""));
+    if (c.uri_matches === false) who.append(el("div", "small state-bad", "certificate URI differs from the application URI"));
+    const thumbTd = el("td", "mono", `${c.thumbprint.slice(0, 8)}…`);
+    thumbTd.title = c.thumbprint;
+    const status = el("td");
+    status.append(el("span", `badge ${c.status}`, TRUST_LABEL[c.status] || c.status));
+    const last = el("td", "small");
+    last.append(el("div", null, c.last_seen ? new Date(c.last_seen * 1000).toLocaleString() : "—"),
+      el("div", "muted", [c.last_policy, c.last_mode].filter(Boolean).join(" · ")),
+      el("div", c.last_result === "accepted" ? "muted" : "state-bad", c.last_result || ""));
+    const act = el("td");
+    const box2 = el("div", "cert-actions");
+    if (c.status !== "trusted") box2.append(certButton("Trust", "primary", () => setTrust(c, "trusted")));
+    if (c.status !== "rejected") box2.append(certButton("Reject", "danger", () => setTrust(c, "rejected")));
+    const a = el("a", "btn small", "Download");
+    a.href = `/api/security/clients/${c.thumbprint}.der`;
+    box2.append(a, certButton("Remove", "", () => removeCert(c)));
+    act.append(box2);
+    tr.append(who, thumbTd, status, last, act);
+    tb.append(tr);
+  }
+  t.append(thead, tb);
+  box.append(t);
+}
+
+function certButton(label, cls, onClick) {
+  const b = el("button", `btn small ${cls}`, label);
+  b.addEventListener("click", onClick);
+  return b;
+}
+
+async function setTrust(c, status) {
+  const verb = status === "trusted" ? "Trust" : "Reject";
+  if (!confirm(`${verb} the certificate of ${c.application || c.subject}?\n\nThumbprint ${c.thumbprint}`)) return;
+  try {
+    await api(`/api/security/clients/${c.thumbprint}`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status }),
+    });
+    toast(`${verb}ed ${c.application || c.subject}` + (status === "trusted" ? " — the client can connect now" : ""));
+    refreshDiagnostics();
+  } catch (e) { toast(e.message, true); }
+}
+
+async function removeCert(c) {
+  if (!confirm(`Remove the certificate of ${c.application || c.subject} from the list?` +
+      "\n\nIf it connects again it is treated as new.")) return;
+  try {
+    await api(`/api/security/clients/${c.thumbprint}`, { method: "DELETE" });
+    refreshDiagnostics();
+  } catch (e) { toast(e.message, true); }
 }
 
 $("diagBtn").addEventListener("click", () => showDiagnostics($("diag").hidden));

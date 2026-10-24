@@ -41,6 +41,7 @@ services:
     build: .
     image: m580-opcua-sim:latest
     container_name: opcua-sim
+    hostname: opcua-sim           # stable name for the OPC UA server certificate
     restart: unless-stopped
     environment:
       DEFAULT_ACCESS: "RW"        # access for comments without an R/O or R/W prefix
@@ -53,6 +54,14 @@ services:
       PLC_UNIT: "1"
       PLC_UPDATE_PERIOD: "1.0"    # seconds between updates of watched tags (subscribed, read or on screen)
       OPCUA_SERVER_NAME: "M580 OPC UA Simulator"
+      # OPC UA security. OPCUA_SECURITY: "all" (None + signed + encrypted), "secure" (no None),
+      # or a list, e.g. "Basic256Sha256_SignAndEncrypt,Aes256Sha256RsaPss_SignAndEncrypt".
+      OPCUA_SECURITY: "all"
+      # Client certificates on signed/encrypted channels: "accept" any valid one, or only
+      # "trusted" ones (approve them on the Diagnostics page).
+      OPCUA_CLIENT_CERTS: "accept"
+      # Extra host names / IPs in the server certificate (clients check the endpoint host).
+      OPCUA_CERT_HOSTS: "opcua-sim,opcua-sim.localtest.me,192.168.0.142"
       MAX_UPLOAD_MB: "100"
     volumes:
       - opcua-sim-data:/data      # last uploaded file and cached PLC dictionaries

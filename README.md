@@ -8,8 +8,42 @@ browser UI to view and change them. Two data sources:
 | **Export** (default) | A `.ZEF`/`.XEF` export. Values start at the program's initial values and change only when written; no logic runs. | Yes |
 | **PLC** | A live PLC or Control Expert PLC simulator over **UMAS** (Modbus TCP 502). The PLC's data dictionary lists the variables; values are polled and writes go to the PLC. Started with **PLC** in the web UI, or at startup with `AUTOCONNECT=true`. | No. An optional `.ZEF`/`.XEF` adds comments and R/O / R/W. |
 
-- **OPC UA:** `opc.tcp://<host>:4840` on all interfaces, anonymous, security policy None
+- **OPC UA:** `opc.tcp://<host>:4840` on all interfaces, anonymous users; unencrypted (None),
+  signed, and signed & encrypted endpoints (see [OPC UA security](#opc-ua-security))
 - **Web UI:** `http://opcua-sim.localtest.me` (through Traefik)
+
+## OPC UA security
+
+The server offers signed and encrypted connections alongside None, with a self-signed
+application certificate it creates on first start.
+
+| Setting | Default | |
+|---|---|---|
+| `OPCUA_SECURITY` | `all` | Endpoints offered. `all` = None + the six below; `secure` = without None; or a comma list of `None`, `Basic256Sha256_Sign`, `Basic256Sha256_SignAndEncrypt`, `Aes128Sha256RsaOaep_Sign`, `Aes128Sha256RsaOaep_SignAndEncrypt`, `Aes256Sha256RsaPss_Sign`, `Aes256Sha256RsaPss_SignAndEncrypt` |
+| `OPCUA_CLIENT_CERTS` | `accept` | `accept`: any valid client certificate is accepted (and listed); `trusted`: only certificates you trust are accepted |
+| `OPCUA_CERT_HOSTS` | | Extra DNS names / IPs for the server certificate, e.g. `opcua-sim,opcua-sim.localtest.me,192.168.0.142` |
+
+**Server certificate.**
+- RSA 2048, valid 5 years, application URI `urn:m580-opcua-simulator`.
+- Its host names are `localhost`, the container hostname and `OPCUA_CERT_HOSTS`; clients check these against the address they connect to. The compose file sets `hostname: opcua-sim` so the certificate doesn't change when the container is recreated.
+- Stored in the data volume under `pki/own/` and reused; it's only regenerated when the host names change or within 30 days of expiry.
+- Download it (DER or PEM) from the Diagnostics page to pre-trust it in a client.
+
+**Client certificates.**
+- Checked when a client opens a signed or encrypted session; unencrypted (None) sessions don't authenticate the client.
+- Every certificate seen is listed on the Diagnostics page with its application, thumbprint, last policy and result, plus Trust / Reject / Remove / Download.
+- Expired certificates are refused (`BadCertificateTimeInvalid`).
+- With `trusted`, an unknown certificate is refused (`BadCertificateUntrusted`) and listed as *Rejected* until you trust it. With `accept`, you can still reject individual certificates.
+- Decisions are kept in `pki/clients.json`.
+
+Secure endpoints allow the same services as the None endpoint. Tag writes are still checked per tag (R/O, type, range). Adding or deleting nodes and references stays refused.
+
+**Connecting Ignition with encryption.**
+1. In the OPC UA connection, choose e.g. `Basic256Sha256` / `SignAndEncrypt`.
+2. Ignition quarantines the simulator's certificate on the first attempt; trust it in the gateway's OPC UA client certificate settings. Compare its thumbprint with the Diagnostics page.
+3. With `OPCUA_CLIENT_CERTS=trusted`, also trust Ignition's certificate on the simulator's Diagnostics page after its first attempt.
+
+Through Traefik the OPC UA traffic is passed through unchanged (TCP), so encryption is end to end.
 
 ## PLC mode
 
@@ -173,6 +207,7 @@ other machines, change the router rule to e.g.
 | `DEFAULT_ACCESS` | `RW` | Access for comments without an R/O or R/W prefix (`RW` or `RO`) |
 | `OPCUA_PORT` | `4840` | |
 | `OPCUA_SERVER_NAME` | `M580 OPC UA Simulator` | |
+| `OPCUA_SECURITY`, `OPCUA_CLIENT_CERTS`, `OPCUA_CERT_HOSTS` | | See [OPC UA security](#opc-ua-security) |
 | `WEB_PORT` | `8000` | Inside the container |
 | `MAX_UPLOAD_MB` | `100` | |
 | `AUTOCONNECT` | `false` | `true`: connect to `PLC_HOST` at startup (PLC mode). Otherwise start in export mode |
@@ -200,7 +235,7 @@ other machines, change the router rule to e.g.
 
   The server keeps the last 240 changes per tag in memory. In PLC mode an open panel counts as watching the tag
 - **Snapshots**: save the current values of all tags, or of the tags the current filter shows, under a name. Apply one later to write back only writable tags whose value differs; R/O tags and tags missing from the program are skipped and reported. In PLC mode the snapshot's tags are read fresh from the PLC first, and changes are written in batches of up to ~70 per request. Snapshots can be downloaded and imported as JSON (`{"name": ..., "values": {"tag.path": value}}`) and are kept in the data volume
-- **Diagnostics** (`#diagnostics`): OPC UA clients (application, address, subscriptions, monitored items, publishing interval); PLC polling (state, reconnects, MAST period, dictionary, watched/background requests, UMAS request rate and timing, cycle-time chart); server (mode, uptime, memory, versions). Refreshes every 2 s
+- **Diagnostics** (`#diagnostics`): OPC UA clients (application, address, subscriptions, monitored items, publishing interval); PLC polling (state, reconnects, MAST period, dictionary, watched/background requests, UMAS request rate and timing, cycle-time chart); server (mode, uptime, memory, versions); OPC UA security (policies, server certificate with downloads, client certificates with Trust / Reject / Remove). The client list shows each session's security policy and mode. Refreshes every 2 s
 - Values changed by the PLC, OPC UA clients or the UI appear live, with who changed them and when
 - **Reset values** (export mode) puts every tag back to the program's initial value
 
@@ -210,6 +245,18 @@ API docs: http://opcua-sim.localtest.me/api/docs
 
 ```bash
 python3 -m unittest discover -s tests
+```
+
+The certificate tests need asyncua; run everything inside the image:
+
+```bash
+docker run --rm -v "$PWD:/proj:ro" -w /proj m580-opcua-sim:latest python -m unittest discover -s tests
+```
+
+End-to-end OPC UA security, against an instance with a program loaded. The last argument is the server's configuration: `trusted` (`OPCUA_SECURITY=all`, `OPCUA_CLIENT_CERTS=trusted`) or `accept` (`OPCUA_SECURITY=secure`, `OPCUA_CLIENT_CERTS=accept`). It writes to one R/W tag and restores it:
+
+```bash
+docker run --rm --network host -v "$PWD/tests:/tests:ro" m580-opcua-sim:latest python /tests/e2e_security.py opc.tcp://<host>:4840 http://<host>:8000 trusted
 ```
 
 End-to-end, export mode (reference program loaded, PLC disconnected):
@@ -227,7 +274,7 @@ docker run --rm --network host -v "$PWD/tests:/tests:ro" -v "$PWD/HAC_SKID_v00_0
 
 ## Limits
 
-- No OPC UA security or user authentication. Use it on a trusted test network only.
+- OPC UA users are anonymous (no username/password), and the web UI has no login: anyone who can reach it can change values, the PLC connection and which client certificates are trusted. Use it on a trusted test network.
 - PLC mode writes to whatever PLC it is pointed at. Point it only at a simulator or a PLC you are allowed to change.
 - PLC mode samples values: watched tags about every `PLC_UPDATE_PERIOD`, others every few seconds. Changes shorter than that are not seen. The first read of an unwatched tag returns its background value; it is fresh from the next cycle on.
 - PLC comments are not stored in the data dictionary, so they need the optional export file.

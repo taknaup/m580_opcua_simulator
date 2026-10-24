@@ -8,7 +8,8 @@ from pathlib import Path
 
 import uvicorn
 
-from .opcua_server import OpcUaServer
+from .opcua_server import APP_URI, OpcUaServer
+from .pki import Pki, parse_policies
 from .simulator import Simulator
 from .web import create_app
 
@@ -28,9 +29,17 @@ async def run():
     if default_access not in ("RW", "RO"):
         raise SystemExit("DEFAULT_ACCESS must be RW or RO")
 
+    data_dir = Path(env("DATA_DIR", "./data"))
+    try:
+        security = parse_policies(env("OPCUA_SECURITY", "all"))
+        pki = Pki(data_dir / "pki", APP_URI, env("OPCUA_CERT_HOSTS", "").split(","),
+                  env("OPCUA_CLIENT_CERTS", "accept").lower())
+    except ValueError as e:
+        raise SystemExit(str(e))
     opcua = OpcUaServer(env("OPCUA_HOST", "0.0.0.0"), int(env("OPCUA_PORT", "4840")),
-                        env("OPCUA_SERVER_NAME", "M580 OPC UA Simulator"), on_client_write=None)
-    sim = Simulator(opcua, Path(env("DATA_DIR", "./data")), default_writable=default_access == "RW",
+                        env("OPCUA_SERVER_NAME", "M580 OPC UA Simulator"), on_client_write=None,
+                        security=security, pki=pki)
+    sim = Simulator(opcua, data_dir, default_writable=default_access == "RW",
                     update_period=float(env("PLC_UPDATE_PERIOD", "1.0")))
     await opcua.start()
 

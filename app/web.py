@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -34,6 +34,13 @@ class WriteRequest(BaseModel):
 class SnapshotRequest(BaseModel):
     name: str
     paths: list[str] | None = None       # None: every tag
+
+
+class TrustRequest(BaseModel):
+    status: str                          # "trusted" or "rejected"
+
+
+_THUMB_RE = re.compile(r"^[0-9A-F]{40}$")
 
 
 class PlcRequest(BaseModel):
@@ -98,6 +105,68 @@ def create_app(sim: Simulator, max_upload_bytes: int) -> FastAPI:
             await sim.reset()
         except NotAvailable as e:
             raise HTTPException(409, str(e))
+        return {"ok": True}
+
+    # ---------------------------------------------------------------- OPC UA security
+    def _pki():
+        pki = sim.opcua.pki
+        if pki is None or not pki.cert_path.exists():
+            raise HTTPException(404, "OPC UA security is not enabled (OPCUA_SECURITY is None only)")
+        return pki
+
+    def _thumb(thumb: str) -> str:
+        t = thumb.upper()
+        if not _THUMB_RE.match(t):
+            raise HTTPException(422, "Invalid certificate thumbprint")
+        return t
+
+    @app.get("/api/security")
+    async def security():
+        pki = sim.opcua.pki
+        secure = pki is not None and pki.cert_path.exists()
+        return {
+            "policies": sim.opcua.security,
+            "client_certs": pki.client_mode if pki else None,
+            "server_certificate": pki.server_cert_info() if secure else None,
+            "clients": pki.clients() if secure else [],
+        }
+
+    @app.get("/api/security/server-cert.{fmt}")
+    async def server_cert(fmt: str):
+        pki = _pki()
+        if fmt == "der":
+            return Response(pki.cert_path.read_bytes(), media_type="application/pkix-cert",
+                            headers={"Content-Disposition": 'attachment; filename="m580-opcua-simulator.der"'})
+        if fmt == "pem":
+            return Response(pki.server_cert_pem(), media_type="application/x-pem-file",
+                            headers={"Content-Disposition": 'attachment; filename="m580-opcua-simulator.pem"'})
+        raise HTTPException(404, "Use .der or .pem")
+
+    @app.get("/api/security/clients/{thumb}.der")
+    async def client_cert(thumb: str):
+        try:
+            der = _pki().client_der(_thumb(thumb))
+        except (KeyError, FileNotFoundError):
+            raise HTTPException(404, "Unknown client certificate")
+        return Response(der, media_type="application/pkix-cert",
+                        headers={"Content-Disposition": f'attachment; filename="{thumb.upper()}.der"'})
+
+    @app.post("/api/security/clients/{thumb}")
+    async def set_client_trust(thumb: str, req: TrustRequest):
+        try:
+            _pki().set_status(_thumb(thumb), req.status)
+        except KeyError:
+            raise HTTPException(404, "Unknown client certificate")
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+        return {"ok": True}
+
+    @app.delete("/api/security/clients/{thumb}")
+    async def remove_client_cert(thumb: str):
+        try:
+            _pki().remove(_thumb(thumb))
+        except KeyError:
+            raise HTTPException(404, "Unknown client certificate")
         return {"ok": True}
 
     # ---------------------------------------------------------------- snapshots
