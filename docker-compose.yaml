@@ -51,7 +51,7 @@ services:
       PLC_HOST: "192.168.0.128"
       PLC_PORT: "502"
       PLC_UNIT: "1"
-      PLC_POLL_INTERVAL: "0.5"    # pause between full scans, seconds
+      PLC_UPDATE_PERIOD: "1.0"    # seconds between updates of watched tags (subscribed, read or on screen)
       OPCUA_SERVER_NAME: "M580 OPC UA Simulator"
       MAX_UPLOAD_MB: "100"
     volumes:

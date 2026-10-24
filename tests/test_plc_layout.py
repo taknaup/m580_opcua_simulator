@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.plc_source import Layout  # noqa: E402
+from app.plc_source import Layout, plan_reads  # noqa: E402
 from app.umas import MemberRecord, TypeRecord, VarRecord  # noqa: E402
 
 # type ids as a Control Expert PLC reports them (elementary ids are fixed)
@@ -58,11 +58,10 @@ class LayoutTests(unittest.TestCase):
     def test_unknown_type_warns(self):
         self.assertTrue(any("Odd" in w for w in self.L.warnings))
 
-    def test_ranges_cover_all_leaves(self):
-        for leaf in self.leaf.values():
-            self.assertTrue(any(b == leaf.block and s <= leaf.offset and leaf.offset + leaf.size <= s + n
-                                for b, s, n in self.L.ranges))
-        self.assertLessEqual(len(self.L.ranges), 2)
+    def test_background_plan_covers_all_leaves(self):
+        plan = plan_reads(self.leaf.items(), 975, 927, 512)
+        self.assertEqual(sorted(p for r in plan for p, _, _ in r.leaves), sorted(self.leaf))
+        self.assertEqual(len(plan), 1)      # everything fits in one 927-byte reply
 
     def test_decode_encode_roundtrip(self):
         L = self.L
@@ -81,6 +80,42 @@ class LayoutTests(unittest.TestCase):
 
     def test_decode_little_endian(self):
         self.assertEqual(self.L.decode(self.L.leaves["Plain"], struct.pack("<i", 30000), 0), 30000)
+
+
+class PlanReadsTests(unittest.TestCase):
+    """Packing scattered tags into UMAS read requests."""
+
+    @staticmethod
+    def leaves(offsets, size=2, block=46):
+        from app.plc_source import Leaf
+        return [(f"T{o}", Leaf(block, o, size, "INT")) for o in offsets]
+
+    def test_close_tags_share_a_reference(self):
+        plan = plan_reads(self.leaves([100, 104, 110]), 975, 927, 16)
+        self.assertEqual(plan[0].segments, [(46, 100, 12)])
+        self.assertEqual([pos for _, _, pos in plan[0].leaves], [0, 4, 10])
+
+    def test_scattered_tags_pack_into_one_request(self):
+        plan = plan_reads(self.leaves(range(0, 100_000, 1000)), 975, 927, 16)
+        self.assertEqual(len(plan), 1)                       # 100 refs x 9 B + 5 B header = 905 B
+        self.assertEqual(len(plan[0].segments), 100)
+        self.assertEqual([pos for _, _, pos in plan[0].leaves][:3], [0, 2, 4])
+
+    def test_request_size_limit(self):
+        plan = plan_reads(self.leaves(range(0, 200_000, 1000)), 975, 927, 16)
+        self.assertEqual([len(r.segments) for r in plan], [107, 93])    # (975 - 5) // 9 = 107
+
+    def test_reply_size_limit(self):
+        plan = plan_reads(self.leaves(range(0, 2000, 200), size=200), 975, 927, 16)
+        self.assertTrue(all(sum(n for _, _, n in r.segments) <= 927 for r in plan))
+        self.assertEqual(sum(len(r.leaves) for r in plan), 10)
+
+    def test_positions_decode_concatenated_reply(self):
+        items = self.leaves([10, 5000, 9000])
+        plan = plan_reads(items, 975, 927, 16)
+        reply = struct.pack("<hhh", 7, -8, 9)                # what the PLC returns: ranges back to back
+        got = {p: Layout.decode(leaf, reply, pos) for p, leaf, pos in plan[0].leaves}
+        self.assertEqual(got, {"T10": 7, "T5000": -8, "T9000": 9})
 
 
 if __name__ == "__main__":

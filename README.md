@@ -21,8 +21,32 @@ only pre-fills the PLC dialog. On connect the server:
    dictionary is cached in the data volume per application CRC, so later connects skip this (~14 s).
 2. Expands structures, arrays and strings into leaf tags with the same names as the export parser,
    e.g. `HAC_RPP2_BRKR07.CntrlSel.ManCmd`.
-3. Reads all tag memory in large contiguous blocks (about 2 s for 6,050 tags; one UMAS request
-   costs roughly one PLC scan cycle) and repeats every `PLC_POLL_INTERVAL` seconds.
+3. Reads every tag once, then polls **on demand** (below).
+
+### On-demand polling
+
+The PLC answers one UMAS request per connection per PLC task cycle (MAST, 100 ms on the
+reference project), whatever the request size. Reading everything every time would grow with
+project size, so each `PLC_UPDATE_PERIOD` (1 s) the server:
+
+1. Reads the **watched** tags: those an OPC UA client has subscribed to, read in the last 60 s,
+   that are on screen in the web UI, or that were written in the last 10 s. Nearby tags share a
+   byte-range reference, and up to ~100 references go in one request, so scattered tags are cheap.
+   Their values are published as soon as they are read.
+2. Spends the rest of the period reading the remaining memory in large chunks, round robin, so
+   every other tag is still refreshed, about every few seconds; the PLC chip's tooltip shows how often.
+
+Measured on the reference project against the Control Expert simulator, with no other clients:
+
+| Watched tags | Requests per cycle | Cycle | Change in PLC → OPC UA subscriber |
+|---|---|---|---|
+| a handful | 1 | 1.0 s | median 0.5 s, max 1.1 s |
+| 1,000 spread over the project | 11 | 1.2 s | |
+
+Cost follows what clients watch, not project size. If a client subscribes to most of a large
+project, the watched part alone needs more than one period (≈ watched data ÷ 927 bytes × task
+cycle) and the cycle stretches accordingly. The tooltip shows the breakdown (subscribed / read /
+web UI).
 
 The PLC project must have **Project Settings › PLC embedded data › Data dictionary** enabled.
 With "HMI variables only" set, the dictionary holds exactly the HMI-flagged variables.
@@ -155,13 +179,13 @@ other machines, change the router rule to e.g.
 | `PLC_HOST` | | PLC / PLC simulator address, used by `AUTOCONNECT` and to pre-fill the PLC dialog (the address last used in the UI is pre-filled instead, when there is one) |
 | `PLC_PORT` | `502` | |
 | `PLC_UNIT` | `1` | Modbus unit id for UMAS |
-| `PLC_POLL_INTERVAL` | `0.5` | Seconds between full scans |
+| `PLC_UPDATE_PERIOD` | `1.0` | Seconds between updates of watched tags (on-demand polling) |
 | `PROGRAM_FILE` | | Export to load at start if none was uploaded yet (comments file in PLC mode) |
 | `LOG_LEVEL` | `INFO` | |
 
 ## Web UI
 
-- **PLC** button: connect to a PLC (host, port, unit id) or disconnect back to export mode. Shows link state and scan time
+- **PLC** button: connect to a PLC (host, port, unit id) or disconnect back to export mode. Shows link state, the number of watched tags and the update cycle; the tooltip shows the request breakdown and the background refresh time
 - Load an export with **Load program** (export mode) or **Load comments file** (PLC mode), or by dropping the file on the page
 - **Table / Tree** views. The tree mirrors the OPC UA address space: variables, then DDT members and array elements. Each folder shows its DDT type, structure comment and tag count. Expand all / Collapse all; arrow keys open and close a focused folder
 - Click a column header to sort (again to reverse); default is Tag A→Z in natural order (`BRKR2` before `BRKR10`). In the tree, folders come first and items sort within each folder. Sorting by Value uses the values at the time of sorting; rows don't jump around as live values change
@@ -195,7 +219,7 @@ docker run --rm --network host -v "$PWD/tests:/tests:ro" -v "$PWD/HAC_SKID_v00_0
 
 - No OPC UA security or user authentication. Use it on a trusted test network only.
 - PLC mode writes to whatever PLC it is pointed at. Point it only at a simulator or a PLC you are allowed to change.
-- PLC mode refreshes values every ~2.5 s (full scan plus poll interval); faster changes between scans are not seen.
+- PLC mode samples values: watched tags about every `PLC_UPDATE_PERIOD`, others every few seconds. Changes shorter than that are not seen. The first read of an unwatched tag returns its background value; it is fresh from the next cycle on.
 - PLC comments are not stored in the data dictionary, so they need the optional export file.
 - DATE, TOD and DT values are read-only in PLC mode.
 - Export mode: values are not persisted across restarts, and no PLC logic runs.

@@ -117,12 +117,13 @@ DLY = "HAC_RPP2_BRKR07.StsAlrt.Dly"
 SP = "HAC_IT_RACK11_BEV11_FLOW.MaxFlow.Sp"
 MAN_AUTO = "HAC_RPP2_BRKR07.CntrlSel.ManAuto"
 RO_TAG = "HAC_RPP2_BRKR07.StsAlrt.Alrt"
+UNWATCHED = "HAC_RPP6_BRKR02.StsAlrt.Dly"              # not subscribed, read or written before the check
 
 
 async def main():
     direct = Direct()
     await direct.start()
-    orig = {p: await direct.read(p) for p in (DLY, SP, MAN_AUTO)}
+    orig = {p: await direct.read(p) for p in (DLY, SP, MAN_AUTO, UNWATCHED)}
     print("original PLC values:", orig, flush=True)
 
     start_mode = http("GET", "/api/status")[1]["mode"]
@@ -164,9 +165,17 @@ async def main():
             h = Sub()
             sub = await client.create_subscription(200, h)
             await sub.subscribe_data_change(dly)
+            await asyncio.sleep(2)
+            p = http("GET", "/api/status")[1]["plc"]
+            cycle = max(p["update_period"], p["scan_time"])
             await direct.write(DLY, 30004)
             val, st, dt = await next_value(h.q, lambda v, st: v == 30004, 15)
-            check(val == 30004, f"PLC-side change reached OPC UA subscriber ({dt and round(dt, 1)}s)")
+            check(val == 30004 and dt <= 2 * cycle + 0.5,
+                  f"PLC-side change reached OPC UA subscriber in {dt and round(dt, 1)}s "
+                  f"(update cycle {cycle:.1f}s, {p['watched']} watched tags)")
+
+            # ---------------- on-demand polling
+            await on_demand_checks(client, n, direct)
 
             # writes landing mid-scan must not bounce back to the old value
             bounces = 0
@@ -223,6 +232,43 @@ async def main():
     await direct.c.close()
     print("\n%d failure(s)" % len(failures))
     sys.exit(1 if failures else 0)
+
+
+async def on_demand_checks(client, n, direct):
+    s = http("GET", "/api/status")[1]["plc"]
+    cycle = max(s["update_period"], s["scan_time"])
+    full = max(s["full_refresh"], cycle)
+    # an unwatched tag is still refreshed by the background pass
+    t0 = time.time()
+    await direct.write(UNWATCHED, 30013)
+    seen = None
+    while time.time() - t0 < full + cycle + 5:
+        rows = http("GET", "/api/tags")[1]["rows"]
+        seen = next(r[2] for r in rows if r[0] == UNWATCHED)
+        if seen == 30013:
+            break
+        await asyncio.sleep(0.25)
+    dt = time.time() - t0
+    check(seen == 30013 and dt <= full + cycle + 2,
+          f"unwatched tag refreshed by background pass in {dt:.1f}s (full refresh {s['full_refresh']}s)")
+    # a client read makes the tag watched
+    await n(UNWATCHED).read_value()
+    await asyncio.sleep(cycle + 1)
+    by = http("GET", "/api/status")[1]["plc"]["watched_by"]
+    check(by.get("read", 0) >= 1, f"OPC UA read marks the tag watched ({by})")
+
+    # load: 1,000 subscribed tags spread over the whole project
+    rows = http("GET", "/api/tags")[1]["rows"]
+    paths = [r[0] for r in rows][::max(1, len(rows) // 1000)][:1000]
+    h = Sub()
+    sub = await client.create_subscription(500, h)
+    await sub.subscribe_data_change([n(p) for p in paths])
+    await asyncio.sleep(6)
+    s2 = http("GET", "/api/status")[1]["plc"]
+    print(f"   load: {s2['watched']} watched tags -> {s2['watched_requests']} requests, "
+          f"cycle {s2['scan_time']}s, full refresh {s2['full_refresh']}s", flush=True)
+    check(s2["watched"] >= len(paths), f"{len(paths)} subscribed tags are watched")
+    await sub.delete()
 
 
 async def relay_server(host, port):
@@ -289,4 +335,5 @@ async def outage_test(client, ns, n, direct):
     await wait_status(lambda s: s["plc"]["host"] == PLC_HOST and s["plc"]["state"] == "connected" and s["program"], 120)
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

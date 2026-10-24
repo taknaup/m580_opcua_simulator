@@ -137,8 +137,17 @@ function renderPlc(s) {
   const dot = $("plcDot");
   dot.className = "dot" + (!plc ? "" : plc.state === "connected" ? " live" : plc.state === "disconnected" ? " bad" : " warn");
   $("plcLabel").textContent = plc
-    ? `PLC ${plc.host}` + (plc.state === "connected" ? ` · ${plc.scan_time}s scan` : ` · ${PLC_STATE[plc.state] || plc.state}`)
+    ? `PLC ${plc.host}` + (plc.state === "connected"
+      ? ` · ${plc.watched.toLocaleString()} watched · ${Math.max(plc.update_period, plc.scan_time).toFixed(1)}s`
+      : ` · ${PLC_STATE[plc.state] || plc.state}`)
     : "PLC: off";
+  $("plcBtn").title = plc && plc.state === "connected"
+    ? `Watched tags (subscribed, read by a client, on screen or just written): ${plc.watched.toLocaleString()} ` +
+      `in ${plc.watched_requests} request${plc.watched_requests === 1 ? "" : "s"}, refreshed every ` +
+      `${Math.max(plc.update_period, plc.scan_time).toFixed(1)} s.\n` +
+      `All other tags: refreshed in the background about every ${plc.full_refresh} s ` +
+      `(${plc.background_requests} request${plc.background_requests === 1 ? "" : "s"} per cycle).`
+    : "Connect to a PLC or PLC simulator over UMAS";
 
   const b = $("plcBanner");
   if (plc && plc.state === "disconnected" && s.program) {
@@ -483,6 +492,22 @@ function render() {
       state.rendered.delete(path);
     }
   }
+  scheduleWatch();
+}
+
+// tell the server which tags are on screen; in PLC mode those are refreshed every period
+let watchTimer = null, lastWatch = "";
+function scheduleWatch() {
+  clearTimeout(watchTimer);
+  watchTimer = setTimeout(sendWatch, 250);
+}
+function sendWatch(force = false) {
+  if (!ws || ws.readyState !== 1) return;
+  const paths = [...state.rendered.keys()].filter((k) => !k.startsWith("f:"));
+  const sig = paths.join("\n");
+  if (!force && sig === lastWatch) return;
+  lastWatch = sig;
+  ws.send(JSON.stringify({ type: "watch", paths }));
 }
 
 function buildRow(row, depth = -1) {
@@ -636,7 +661,7 @@ function connect() {
     $("wsState").textContent = "live";
     $("wsState").className = "ws-on";
     // re-sync in case anything changed while disconnected
-    refreshStatus().then(loadTags).catch((e) => toast(e.message, true));
+    refreshStatus().then(loadTags).then(() => sendWatch(true)).catch((e) => toast(e.message, true));
   };
   ws.onmessage = (m) => {
     const msg = JSON.parse(m.data);

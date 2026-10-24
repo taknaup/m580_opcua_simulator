@@ -31,7 +31,7 @@ async def run():
     opcua = OpcUaServer(env("OPCUA_HOST", "0.0.0.0"), int(env("OPCUA_PORT", "4840")),
                         env("OPCUA_SERVER_NAME", "M580 OPC UA Simulator"), on_client_write=None)
     sim = Simulator(opcua, Path(env("DATA_DIR", "./data")), default_writable=default_access == "RW",
-                    poll_interval=float(env("PLC_POLL_INTERVAL", "0.5")))
+                    update_period=float(env("PLC_UPDATE_PERIOD", "1.0")))
     await opcua.start()
 
     # Default: serve the export file. AUTOCONNECT=true connects to PLC_HOST at startup;

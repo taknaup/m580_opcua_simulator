@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from pathlib import Path
@@ -17,6 +18,7 @@ from .xef_parser import ParseError
 log = logging.getLogger(__name__)
 STATIC = Path(__file__).parent / "static"
 PUSH_INTERVAL = 0.15
+MAX_UI_WATCH = 2000          # rows one browser may ask to keep fresh
 
 
 _HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.\-]{0,252})$|^\[?[0-9A-Fa-f:]+\]?$")
@@ -153,12 +155,22 @@ def create_app(sim: Simulator, max_upload_bytes: int) -> FastAPI:
                 await asyncio.sleep(PUSH_INTERVAL)
 
         task = asyncio.create_task(pusher())
+        key = id(socket)
         try:
             while True:
-                await socket.receive_text()   # client pings; we only push
+                text = await socket.receive_text()
+                if text.startswith("{"):
+                    # {"type": "watch", "paths": [...]}: rows on screen, refreshed every period
+                    try:
+                        msg = json.loads(text)
+                    except ValueError:
+                        continue
+                    if msg.get("type") == "watch" and isinstance(msg.get("paths"), list):
+                        sim.set_ui_watch(key, {p for p in msg["paths"][:MAX_UI_WATCH] if isinstance(p, str)})
         except WebSocketDisconnect:
             pass
         finally:
+            sim.set_ui_watch(key, None)
             sim.remove_listener(on_event)
             task.cancel()
 

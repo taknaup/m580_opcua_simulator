@@ -45,11 +45,13 @@ class NotAvailable(Exception):
 
 
 class Simulator:
-    def __init__(self, opcua: OpcUaServer, data_dir: Path, default_writable: bool, poll_interval: float = 0.5):
+    def __init__(self, opcua: OpcUaServer, data_dir: Path, default_writable: bool, update_period: float = 1.0):
         self.opcua = opcua
         self.data_dir = data_dir
         self.default_writable = default_writable
-        self.poll_interval = poll_interval
+        self.update_period = update_period
+        self.ui_watch: dict[int, set[str]] = {}    # web UI connection -> tags on screen
+        self.watch_stats: dict[str, int] = {}
         self.mode = "export"
         self.export: Program | None = None        # last uploaded .ZEF/.XEF
         self.program: Program | None = None       # what is being served
@@ -175,8 +177,9 @@ class Simulator:
             self.program, self.tags, self.values = None, {}, {}
             self.changed_at, self.sources = {}, {}
         self.opcua.write_hook = self._opcua_write_to_plc
-        self.plc = PlcSource(host, port, unit, self.poll_interval, self.data_dir,
-                             self._on_layout, self._on_values, self._on_plc_state)
+        self.plc = PlcSource(host, port, unit, self.update_period, self.data_dir,
+                             self._on_layout, self._on_values, self._on_plc_state,
+                             watched=self.watched_paths)
         self.plc.start()
         self._reloaded()
 
@@ -232,6 +235,20 @@ class Simulator:
         if state == "disconnected" and self.tags:
             asyncio.create_task(self.opcua.mark_all(ua.StatusCodes.BadNotConnected))
         self.notify_status()
+
+    def watched_paths(self) -> set[str]:
+        """Tags to refresh every update period: OPC UA subscriptions/reads and web UI rows."""
+        subscribed = self.opcua.subscribed_paths()
+        read = self.opcua.read_paths()
+        ui = set().union(*self.ui_watch.values()) if self.ui_watch else set()
+        self.watch_stats = {"subscribed": len(subscribed), "read": len(read), "web_ui": len(ui)}
+        return subscribed | read | ui
+
+    def set_ui_watch(self, key: int, paths: set[str] | None):
+        if paths is None:
+            self.ui_watch.pop(key, None)
+        else:
+            self.ui_watch[key] = paths
 
     # ---------------------------------------------------------------- export overlay (PLC mode)
     def _overlay_tags(self, program: Program):
@@ -332,6 +349,11 @@ class Simulator:
             plc = {"host": self.plc.host, "port": self.plc.port, "unit": self.plc.unit,
                    "state": self.plc.state, "error": self.plc.error,
                    "scan_time": round(self.plc.scan_time, 2), "last_scan": self.plc.last_scan,
+                   "update_period": self.plc.update_period,
+                   "watched": self.plc.watched_count, "watched_requests": self.plc.watched_requests,
+                   "background_requests": self.plc.background_requests,
+                   "full_refresh": round(self.plc.full_refresh, 1),
+                   "watched_by": self.watch_stats,
                    "crc": f"{self.plc.crc:08x}" if self.plc.crc else None}
         export = None
         if self.export:

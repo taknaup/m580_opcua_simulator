@@ -273,6 +273,23 @@ class UmasClient:
             raise UmasError(f"short read: {len(data)} of {length} bytes at {block}:{address}")
         return data[:length]
 
+    @property
+    def max_request(self) -> int:
+        """Largest request payload that fits in one frame."""
+        return max(64, (self.info.max_frame or 256) - 16)
+
+    async def read_segments(self, segments: list[tuple[int, int, int]]) -> bytes:
+        """Read several (block, address, length) byte ranges in one request.
+
+        The reply is the ranges' bytes back to back, in request order.
+        """
+        refs = b"".join(struct.pack("<BHBHBH", 0x11, b, 0x01, a >> 8, a & 0xFF, n) for b, a, n in segments)
+        data = await self.request(F_READ_VARIABLES, struct.pack("<IB", self.info.crc, len(segments)) + refs)
+        want = sum(n for _, _, n in segments)
+        if len(data) < want:
+            raise UmasError(f"short read: {len(data)} of {want} bytes for {len(segments)} ranges")
+        return data[:want]
+
     async def write_bytes(self, block: int, address: int, data: bytes):
         ref = struct.pack("<BHIH", 0x11, block, address, len(data)) + data
         await self.request(F_WRITE_VARIABLES, struct.pack("<IB", self.info.crc, 1) + ref)

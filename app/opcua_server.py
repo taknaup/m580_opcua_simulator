@@ -48,6 +48,8 @@ class OpcUaServer:
         self._tags: dict[str, Tag] = {}            # NodeId string id -> Tag
         self._folders: dict[str, str] = {}          # structure folder path -> comment, parents first
         self._meta: dict[str, tuple] = {}           # tag path -> (comment, writable) on the node
+        self._reads: dict[str, float] = {}          # tag path -> last time a client read it
+        self._orig_read = None
         self._orig_write = None
 
     async def start(self):
@@ -61,6 +63,8 @@ class OpcUaServer:
         attr_service = self.server.iserver.attribute_service
         self._orig_write = attr_service.write
         attr_service.write = self._checked_write
+        self._orig_read = attr_service.read
+        attr_service.read = self._tracked_read
         await self.server.start()
         log.info("OPC UA server listening on %s", self.endpoint)
 
@@ -297,6 +301,38 @@ class OpcUaServer:
                     self._folder_id(prefix), ua.AttributeIds.Description,
                     ua.DataValue(ua.Variant(ua.LocalizedText(comment), ua.VariantType.LocalizedText)))
                 self._folders[prefix] = comment
+
+    # ---------------------------------------------------------------- what clients watch
+    def _tracked_read(self, params: ua.ReadParameters):
+        """Note which tags clients read (they are polled faster for a while)."""
+        now = time.time()
+        for rv in params.NodesToRead:
+            nid = rv.NodeId
+            if (nid.NamespaceIndex == self.ns and rv.AttributeId == ua.AttributeIds.Value
+                    and nid.Identifier in self._tags):
+                self._reads[nid.Identifier] = now
+        return self._orig_read(params)
+
+    def subscribed_paths(self) -> set[str]:
+        """Tags with an active subscription (monitored item) from any client.
+
+        Every monitored item registers a data-change callback; asyncua keeps them in
+        handle -> (node id, attribute), so this costs O(subscribed items), not O(tags).
+        """
+        out = set()
+        for nid, attr in list(self.server.iserver.aspace._handle_to_attribute_map.values()):
+            if (attr == ua.AttributeIds.Value and nid.NamespaceIndex == self.ns
+                    and nid.Identifier in self._tags):
+                out.add(nid.Identifier)
+        return out
+
+    def read_paths(self, read_ttl: float = 60.0) -> set[str]:
+        """Tags a client read in the last `read_ttl` seconds."""
+        now = time.time()
+        for path, t in list(self._reads.items()):
+            if now - t > read_ttl or path not in self._tags:
+                del self._reads[path]
+        return set(self._reads)
 
     # ---------------------------------------------------------------- client writes
     async def _checked_write(self, params: ua.WriteParameters, user=None):

@@ -34,7 +34,7 @@ _STRUCT = {"INT": "<h", "UINT": "<H", "WORD": "<H", "DINT": "<i", "UDINT": "<I",
            "TIME": "<I", "REAL": "<f", "BYTE": "<B"}
 _ARRAY_RE = re.compile(r"^ARRAY\s*\[(.+?)\]\s*OF\s+(.+)$", re.I)
 _STRING_RE = re.compile(r"^STRING\[(\d+)\]$", re.I)
-GAP_MERGE = 512           # read across gaps smaller than this (one request costs ~1 PLC cycle)
+GAP_MERGE = 512           # background reads span gaps smaller than this (one request costs ~1 PLC cycle)
 
 
 @dataclass
@@ -59,8 +59,6 @@ class Layout:
         self.struct_types: dict[str, str] = {}     # structure/array path -> type name
         for v in variables:
             self._expand(v.name, v.type_id, v.block, v.offset)
-        self.ranges = self._plan_ranges()
-        self.ordered = sorted(self.leaves.items(), key=lambda kv: (kv[1].block, kv[1].offset))
 
     # ---------------------------------------------------------------- expansion
     def _type_of(self, type_id: int):
@@ -146,17 +144,6 @@ class Layout:
         self.tags.append(Tag(path, ti.name, ti, None, writable, "default", "", [], ""))
         self.leaves[path] = Leaf(block, offset, size, plc_type)
 
-    def _plan_ranges(self) -> list[tuple[int, int, int]]:
-        """Merge leaves into contiguous (block, start, length) spans."""
-        spans: list[list[int]] = []
-        for leaf in sorted(self.leaves.values(), key=lambda x: (x.block, x.offset)):
-            end = leaf.offset + leaf.size
-            if spans and spans[-1][0] == leaf.block and leaf.offset - spans[-1][2] <= GAP_MERGE:
-                spans[-1][2] = max(spans[-1][2], end)
-            else:
-                spans.append([leaf.block, leaf.offset, end])
-        return [(b, s, e - s) for b, s, e in spans]
-
     def program(self, host: str) -> Program:
         return Program(name=self.project or "PLC", version="", product=f"PLC at {host} (UMAS)",
                        plc="", source_file="", tags=self.tags, warnings=self.warnings,
@@ -209,24 +196,91 @@ def _bcd(b: int) -> int:
     return (b >> 4) * 10 + (b & 0x0F)
 
 
-class PlcSource:
-    """Keeps a UMAS connection, polls all tags and writes values back."""
+REF_BYTES = 9           # one byte-range reference in a UMAS read request
+REQ_HEADER = 5          # CRC + reference count
+WATCH_GAP = 16          # watched tags closer than this share one reference
+HOT_SECONDS = 10.0      # a written tag stays watched this long (to see the logic react)
 
-    def __init__(self, host: str, port: int, unit: int, poll_interval: float, cache_dir: Path,
-                 on_layout: Callable, on_values: Callable, on_state: Callable):
+
+@dataclass
+class ReadRequest:
+    segments: list[tuple[int, int, int]]            # (block, address, length)
+    leaves: list[tuple[str, "Leaf", int]]           # (path, leaf, position in the reply)
+
+
+def plan_reads(items, max_request: int, max_reply: int, gap: int) -> list[ReadRequest]:
+    """Pack tags into as few UMAS read requests as possible.
+
+    Tags closer than `gap` bytes share one byte-range reference; references are packed
+    into a request while both the request and its reply fit in one frame. Each request
+    costs about one PLC cycle, however many references it carries.
+    """
+    segs: list[list] = []                          # [block, start, end, [(path, leaf)]]
+    for path, leaf in sorted(items, key=lambda kv: (kv[1].block, kv[1].offset)):
+        end = leaf.offset + leaf.size
+        if segs:
+            last = segs[-1]
+            if (last[0] == leaf.block and leaf.offset - last[2] <= gap
+                    and max(last[2], end) - last[1] <= max_reply):
+                last[2] = max(last[2], end)
+                last[3].append((path, leaf))
+                continue
+        segs.append([leaf.block, leaf.offset, end, [(path, leaf)]])
+    out: list[ReadRequest] = []
+    reply = 0
+    for block, start, end, members in segs:
+        length = end - start
+        cur = out[-1] if out else None
+        if (cur is None or len(cur.segments) >= 255
+                or REQ_HEADER + REF_BYTES * (len(cur.segments) + 1) > max_request
+                or reply + length > max_reply):
+            cur = ReadRequest([], [])
+            out.append(cur)
+            reply = 0
+        for path, leaf in members:
+            cur.leaves.append((path, leaf, reply + leaf.offset - start))
+        cur.segments.append((block, start, length))
+        reply += length
+    return out
+
+
+class PlcSource:
+    """Keeps a UMAS connection, polls tags on demand and writes values back.
+
+    Every `update_period` seconds the watched tags (from `watched()`: subscribed, read,
+    on screen, or just written) are read, packed into as few requests as possible. The
+    rest of the period reads the remaining memory in large chunks, round robin, so every
+    tag is still refreshed; how often depends on project size, the watched set does not.
+    """
+
+    def __init__(self, host: str, port: int, unit: int, update_period: float, cache_dir: Path,
+                 on_layout: Callable, on_values: Callable, on_state: Callable,
+                 watched: Callable[[], set] | None = None):
         self.host, self.port, self.unit = host, port, unit
-        self.poll_interval = poll_interval
+        self.update_period = update_period
+        self.watched = watched or (lambda: set())
         self.cache_dir = cache_dir
         self.on_layout, self.on_values, self.on_state = on_layout, on_values, on_state
         self.client: UmasClient | None = None
         self.layout: Layout | None = None
         self.state = "connecting"
         self.error = ""
-        self.scan_time = 0.0
+        self.scan_time = 0.0          # duration of the last cycle (watched + background)
         self.last_scan = 0.0
         self.crc = 0
-        self._raw: dict[str, int] = {}             # EBOOL raw bytes from the last scan
+        self.watched_count = 0
+        self.watched_requests = 0
+        self.background_requests = 0  # per cycle
+        self.full_refresh = 0.0       # seconds for the background pass to cover every tag
+        self._req_time = 0.1          # running average of one request, seconds
+        self._background: list[ReadRequest] = []
+        self._cursor = 0
+        self._pass_started = 0.0
+        self._watch_key: frozenset | None = None
+        self._watch_plan: list[ReadRequest] = []
+        self._raw: dict[str, int] = {}             # EBOOL raw bytes from the last read
         self._written_at: dict[str, float] = {}    # path -> time of our last write to it
+        self._hot: dict[str, float] = {}           # path -> time written (kept watched briefly)
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
 
@@ -309,15 +363,18 @@ class PlcSource:
             except OSError as e:
                 log.warning("Could not cache PLC dictionary: %s", e)
         self.layout = Layout(project, types, variables, members)
+        self._background = plan_reads(self.layout.leaves.items(), c.max_request, c.chunk_size, GAP_MERGE)
+        self._cursor, self._watch_key, self._watch_plan = 0, None, []
+        self._pass_started = time.time()
         values = await self.scan()
         await self.on_layout(self.layout, values)
         self._set_state("connected")
 
     async def _poll_loop(self):
         while not self._stop.is_set():
-            await asyncio.sleep(self.poll_interval)
+            t0 = time.time()
             try:
-                values = await self.scan()
+                await self._cycle(t0)
             except UmasError as e:
                 if isinstance(e, UmasConnectionError):
                     raise
@@ -327,40 +384,77 @@ class PlcSource:
                     await self._load_layout()
                     continue
                 raise
-            await self.on_values(values)
+            await asyncio.sleep(max(0.0, self.update_period - (time.time() - t0)))
 
-    async def scan(self) -> dict[str, object]:
-        """Read every tag; returns {path: value}."""
-        t = time.time()
-        c, layout = self.client, self.layout
-        buffers: list[tuple[int, int, bytes]] = []
-        for block, start, length in layout.ranges:
-            pos = 0
-            parts = []
-            while pos < length:
-                n = min(c.chunk_size, length - pos)
-                parts.append(await c.read_bytes(block, start + pos, n))
-                pos += n
-            buffers.append((block, start, b"".join(parts)))
+    def _watched_plan(self) -> list[ReadRequest]:
+        now = time.time()
+        for path, t in list(self._hot.items()):
+            if now - t > HOT_SECONDS:
+                del self._hot[path]
+        leaves = self.layout.leaves
+        key = frozenset(p for p in (self.watched() | set(self._hot)) if p in leaves)
+        if key != self._watch_key:
+            self._watch_key = key
+            self._watch_plan = plan_reads(((p, leaves[p]) for p in key),
+                                          self.client.max_request, self.client.chunk_size, WATCH_GAP)
+        return self._watch_plan
+
+    async def _cycle(self, t0: float):
+        """One update period: all watched tags, then background chunks with the time left.
+
+        Watched values are published as soon as they are read, before the background part.
+        """
+        values: dict[str, object] = {}
+        plan = self._watched_plan()
+        for req in plan:
+            await self._execute(req, values)
+        self._drop_stale(values, t0)
+        await self.on_values(values)
         values = {}
-        bi = 0
-        for path, leaf in layout.ordered:
-            while not (buffers[bi][0] == leaf.block and buffers[bi][1] <= leaf.offset
-                       < buffers[bi][1] + len(buffers[bi][2])):
-                bi += 1
-            block, start, data = buffers[bi]
-            pos = leaf.offset - start
-            values[path] = layout.decode(leaf, data, pos)
+        left = self.update_period - (time.time() - t0)
+        n_bg = min(len(self._background), max(1, int(left / self._req_time)))
+        for _ in range(n_bg):
+            await self._execute(self._background[self._cursor], values)
+            self._cursor += 1
+            if self._cursor >= len(self._background):
+                self._cursor = 0
+                now = time.time()
+                self.full_refresh = now - self._pass_started
+                self._pass_started = now
+        self._drop_stale(values, t0)
+        await self.on_values(values)
+        self.watched_count = len(self._watch_key or ())
+        self.watched_requests, self.background_requests = len(plan), n_bg
+        self.scan_time = time.time() - t0
+        self.last_scan = time.time()
+
+    async def _execute(self, req: ReadRequest, values: dict):
+        t = time.time()
+        data = await self.client.read_segments(req.segments)
+        self._req_time = 0.8 * self._req_time + 0.2 * (time.time() - t)
+        decode = self.layout.decode
+        for path, leaf, pos in req.leaves:
+            values[path] = decode(leaf, data, pos)
             if leaf.plc_type == "EBOOL":
                 self._raw[path] = data[pos]
-        # a scan that began before a write still holds the old value; drop it so a
-        # just-written value is not briefly overwritten (it is picked up next scan)
+
+    def _drop_stale(self, values: dict, started: float):
+        # a read that began before a write still holds the old value; drop it so a
+        # just-written value is not briefly overwritten (it is picked up next cycle)
         for path, written in list(self._written_at.items()):
-            if written >= t:
+            if written >= started:
                 values.pop(path, None)
             else:
                 del self._written_at[path]
-        self.scan_time = time.time() - t
+
+    async def scan(self) -> dict[str, object]:
+        """Read every tag once; returns {path: value}."""
+        t = time.time()
+        values: dict[str, object] = {}
+        for req in self._background:
+            await self._execute(req, values)
+        self._drop_stale(values, t)
+        self.scan_time = self.full_refresh = time.time() - t
         self.last_scan = time.time()
         return values
 
@@ -370,7 +464,7 @@ class PlcSource:
             raise UmasConnectionError(f"PLC {self.address} is not connected")
         leaf = self.layout.leaves[path]
         data = self.layout.encode(leaf, value, self._raw.get(path))
-        self._written_at[path] = time.time()
+        self._written_at[path] = self._hot[path] = time.time()
         await self.client.write_bytes(leaf.block, leaf.offset, data)
         raw = await self.client.read_bytes(leaf.block, leaf.offset, leaf.size)
         if leaf.plc_type == "EBOOL":
