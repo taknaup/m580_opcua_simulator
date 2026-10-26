@@ -15,6 +15,13 @@ function duration(seconds) {
   return `${s}s`;
 }
 
+// a table scrolls inside its card instead of spilling over the next one
+function tableWrap(t) {
+  const w = el("div", "table-wrap");
+  w.append(t);
+  return w;
+}
+
 function tile(label, value, sub) {
   const t = el("div", "tile");
   t.append(el("div", "t-label", label), el("div", "t-value", value));
@@ -118,24 +125,28 @@ async function refreshDiagnostics() {
   if (!ua.clients.length) {
     cl.replaceChildren(el("p", "muted small", `No clients connected. Endpoint port ${ua.port}.`));
   } else {
-    const t = el("table");
+    const t = el("table", "diag-table clients-table");
     const hr = el("tr");
-    for (const h of ["Client", "Address", "Security", "Connected", "Subscribed", "Publishing"]) hr.append(el("th", null, h));
+    for (const h of ["Client", "Connection", "Subscribed", "Connected"]) hr.append(el("th", null, h));
     const thead = el("thead"); thead.append(hr);
     const tb = el("tbody");
     for (const c of ua.clients) {
       const tr = el("tr");
-      const who = el("td");
+      const who = el("td", "wrap");
       who.append(el("div", null, c.application || "(no name)"));
-      if (c.session) who.append(el("div", "muted small", c.session));
-      tr.append(who, el("td", "mono", c.address), el("td", null, c.security || "None"),
-        el("td", null, c.since ? duration(d.now - c.since) : c.state),
-        el("td", null, `${c.monitored_items.toLocaleString()} in ${c.subscriptions}`),
-        el("td", null, c.publishing_ms.length ? c.publishing_ms.map((m) => `${m} ms`).join(", ") : "—"));
+      if (c.session && c.session !== c.application) who.append(el("div", "muted small", c.session));
+      const conn = el("td", "wrap");
+      conn.append(el("div", "mono", c.address), el("div", "muted small", c.security || "None"));
+      const subs = el("td");
+      subs.append(el("div", null, `${c.monitored_items.toLocaleString()} tag${c.monitored_items === 1 ? "" : "s"}`),
+        el("div", "muted small", c.subscriptions
+          ? `${c.subscriptions} subscription${c.subscriptions === 1 ? "" : "s"} · ${c.publishing_ms.map((m) => `${m} ms`).join(", ")}`
+          : "no subscriptions"));
+      tr.append(who, conn, subs, el("td", "nowrap", c.since ? duration(d.now - c.since) : c.state));
       tb.append(tr);
     }
     t.append(thead, tb);
-    cl.replaceChildren(t);
+    cl.replaceChildren(tableWrap(t));
   }
   cl.append(el("p", "muted small", `Tags read by clients in the last minute: ${ua.recently_read_tags.toLocaleString()}`));
 
@@ -176,7 +187,7 @@ function renderSecurity(sec) {
   }
   const sc = sec.server_certificate;
   if (sc) {
-    const thumb = el("span");
+    const thumb = el("span", "inline-copy");
     thumb.append(el("span", "mono", sc.thumbprint), copyButton(sc.thumbprint, "Thumbprint"));
     const dl = el("span", "cert-actions");
     for (const fmt of ["der", "pem"]) {
@@ -202,22 +213,22 @@ function renderSecurity(sec) {
     box.append(el("p", "muted small", "No client has connected with a signed or encrypted channel yet."));
     return;
   }
-  const t = el("table");
+  const t = el("table", "diag-table certs-table");
   const hr = el("tr");
   for (const h of ["Client", "Thumbprint", "Status", "Last connection", ""]) hr.append(el("th", null, h));
   const thead = el("thead"); thead.append(hr);
   const tb = el("tbody");
   for (const c of sec.clients) {
     const tr = el("tr");
-    const who = el("td");
+    const who = el("td", "wrap");
     who.append(el("div", null, c.application || c.subject));
     who.append(el("div", "muted small", c.application_uri || c.certificate_uri || ""));
     if (c.uri_matches === false) who.append(el("div", "small state-bad", "certificate URI differs from the application URI"));
-    const thumbTd = el("td", "mono", `${c.thumbprint.slice(0, 8)}…`);
+    const thumbTd = el("td", "mono nowrap", `${c.thumbprint.slice(0, 8)}…`);
     thumbTd.title = c.thumbprint;
     const status = el("td");
     status.append(el("span", `badge ${c.status}`, TRUST_LABEL[c.status] || c.status));
-    const last = el("td", "small");
+    const last = el("td", "small wrap");
     last.append(el("div", null, c.last_seen ? new Date(c.last_seen * 1000).toLocaleString() : "—"),
       el("div", "muted", [c.last_policy, c.last_mode].filter(Boolean).join(" · ")),
       el("div", c.last_result === "accepted" ? "muted" : "state-bad", c.last_result || ""));
@@ -233,7 +244,7 @@ function renderSecurity(sec) {
     tb.append(tr);
   }
   t.append(thead, tb);
-  box.append(t);
+  box.append(tableWrap(t));
 }
 
 function certButton(label, cls, onClick) {

@@ -319,13 +319,40 @@ dialog label.btn { flex-direction: row; margin: 0; flex: none; color: var(--text
 .diag[hidden] { display: none; }
 .diag-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .diag-head h2 { margin: 0; font-size: 18px; }
-.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(150px, 100%), 1fr)); gap: 10px; }
 .tile { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: var(--panel); }
 .tile .t-label { font-size: 12px; color: var(--muted); }
-.tile .t-value { font-size: 22px; font-weight: 650; margin-top: 2px; }
+.tile { min-width: 0; }
+.tile .t-value { font-size: 22px; font-weight: 650; margin-top: 2px; overflow-wrap: anywhere; }
+.tile .t-sub { overflow-wrap: anywhere; }
 .tile .t-sub { font-size: 11.5px; color: var(--muted); }
-.diag-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 14px; align-items: start; }
-.diag-grid .d-card { background: var(--panel); }
+.diag-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); gap: 14px; align-items: start; }
+.diag-grid .d-card { background: var(--panel); min-width: 0; }
+.diag-grid > * { min-width: 0; }
+.diag .d-card dl { grid-template-columns: minmax(96px, 150px) minmax(0, 1fr); }
+.diag .d-card dd { flex-wrap: wrap; align-items: center; overflow-wrap: anywhere; }
+.diag .d-card dd > span { min-width: 0; }
+.diag .d-card dd .mono { word-break: break-all; }
+.table-wrap { max-width: 100%; overflow-x: auto; }
+.inline-copy { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; min-width: 0; }
+.diag-table { table-layout: auto; }
+.diag-table td.wrap { overflow-wrap: anywhere; min-width: 120px; }
+.diag-table td.wrap .mono { word-break: break-all; }
+.diag-table td.nowrap, .diag-table th { white-space: nowrap; }
+@media (max-width: 640px) {
+  .diag { padding: 12px 12px 24px; }
+  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  /* client and certificate rows as stacked cards */
+  .diag-table thead { display: none; }
+  .diag-table, .diag-table tbody, .diag-table tr, .diag-table td { display: block; width: 100%; }
+  .diag-table tr { padding: 8px 0; border-bottom: 1px solid var(--line); }
+  .diag-table td { border: 0; padding: 2px 0; min-width: 0; }
+  .diag-table td.nowrap { white-space: normal; }
+  /* label above value, so values get the full card width */
+  .diag .d-card dl { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  .diag .d-card dt { margin-top: 8px; font-size: 12px; }
+  .diag .d-card dt:first-child { margin-top: 0; }
+}
 .diag table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .diag th { text-align: left; font-size: 11.5px; color: var(--muted); font-weight: 600; padding: 4px 8px 4px 0; border-bottom: 1px solid var(--line); }
 .diag td { padding: 5px 8px 5px 0; border-bottom: 1px solid var(--line); vertical-align: top; font-variant-numeric: tabular-nums; }
@@ -333,7 +360,7 @@ dialog label.btn { flex-direction: row; margin: 0; flex: none; color: var(--text
 .state-ok { color: var(--on); font-weight: 600; }
 .diag-wide { grid-column: 1 / -1; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
-.chip { font-family: var(--mono); font-size: 11.5px; padding: 2px 8px; border-radius: 99px; background: var(--rw-soft); color: var(--rw); }
+.chip { font-family: var(--mono); font-size: 11.5px; padding: 2px 8px; border-radius: 99px; background: var(--rw-soft); color: var(--rw); white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 .chip.off { background: var(--ro-soft); color: var(--ro); }
 .badge.trusted { background: var(--accent-soft); color: var(--accent); }
 .badge.auto { background: var(--rw-soft); color: var(--rw); }
