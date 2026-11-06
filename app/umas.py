@@ -38,6 +38,10 @@ class UmasConnectionError(UmasError):
     pass
 
 
+class UmasNoDictionary(UmasError):
+    """The PLC application was built without an embedded data dictionary."""
+
+
 @dataclass
 class VarRecord:
     name: str
@@ -121,7 +125,6 @@ class UmasClient:
         self._rx_task = asyncio.create_task(self._rx_loop())
         await self._init_comms()
         await self.read_status()
-        await self._read_basic_info()
 
     @property
     def connected(self) -> bool:
@@ -211,9 +214,21 @@ class UmasClient:
             self.info.crc = (self.info.status_blocks[3] + self.info.status_blocks[4]) & 0xFFFFFFFF
         return self.info.crc
 
-    async def _read_basic_info(self):
+    async def read_dictionary_id(self):
+        """Read the identifiers the dictionary requests need from the dictionary block.
+
+        Memory block 0x30 holds the embedded data dictionary. It exists only when the
+        application was built with Project Settings > PLC embedded data > Data dictionary;
+        without it the PLC rejects the read (and every dictionary request).
+        """
         payload = struct.pack("<BHHHH", 0, 0x30, 0, 0, 0x21)
-        r = _Reader(await self.request(F_READ_MEMORY_BLOCK, payload))
+        try:
+            data = await self.request(F_READ_MEMORY_BLOCK, payload)
+        except UmasConnectionError:
+            raise
+        except UmasError as e:
+            raise UmasNoDictionary(f"PLC has no embedded data dictionary ({e})") from e
+        r = _Reader(data)
         r.u8(); r.u16()
         r.u16(); r.u16()
         self.info.index = r.u8()

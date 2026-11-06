@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Callable
 
 from .iec_values import type_info
-from .umas import TypeRecord, UmasClient, UmasConnectionError, UmasError
+from .umas import TypeRecord, UmasClient, UmasConnectionError, UmasError, UmasNoDictionary
 from .xef_parser import Program, Tag
 
 log = logging.getLogger(__name__)
@@ -201,6 +201,7 @@ REF_BYTES = 9           # one byte-range reference in a UMAS read request
 REQ_HEADER = 5          # CRC + reference count
 WATCH_GAP = 16          # watched tags closer than this share one reference
 HOT_SECONDS = 10.0      # a written tag stays watched this long (to see the logic react)
+APP_CHECK_SECONDS = 5.0  # without a data dictionary: how often to check for a new download
 
 
 @dataclass
@@ -320,6 +321,7 @@ class PlcSource:
     async def _run(self):
         backoff = 2.0
         while not self._stop.is_set():
+            retry_now = False
             try:
                 self._set_state("connecting")
                 self.client = UmasClient(self.host, self.port, self.unit, stats=self.umas_stats)
@@ -333,6 +335,14 @@ class PlcSource:
                 await self._poll_loop()
             except asyncio.CancelledError:
                 raise
+            except UmasNoDictionary as e:
+                # Reconnecting cannot help until a new application is downloaded: stay
+                # connected and watch the application CRC instead.
+                self._set_state("no dictionary", str(e))
+                try:
+                    retry_now = await self._wait_for_new_application()
+                except (UmasError, OSError) as e2:
+                    self._set_state("disconnected", str(e2))
             except (UmasError, OSError) as e:
                 self._set_state("disconnected", str(e))
             except Exception as e:
@@ -340,11 +350,29 @@ class PlcSource:
                 self._set_state("disconnected", f"{type(e).__name__}: {e}")
             if self.client:
                 await self.client.close()
+            if retry_now:
+                backoff = 2.0
+                continue
             try:
                 await asyncio.wait_for(self._stop.wait(), backoff)
             except asyncio.TimeoutError:
                 pass
             backoff = min(backoff * 2, 30.0)
+
+    async def _wait_for_new_application(self) -> bool:
+        """Poll the application CRC; True once it changes (a new download), False on stop."""
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), APP_CHECK_SECONDS)
+                return False
+            except asyncio.TimeoutError:
+                pass
+            crc = await self.client.read_status()
+            if crc != self.crc:
+                log.info("PLC %s: application changed (CRC %08x -> %08x); retrying",
+                         self.address, self.crc, crc)
+                return True
+        return False
 
     async def _load_layout(self):
         c = self.client
@@ -360,6 +388,14 @@ class PlcSource:
             except Exception:
                 log.warning("Ignoring unreadable dictionary cache %s", cache.name)
         if types is None:
+            try:
+                await c.read_dictionary_id()
+            except UmasNoDictionary:
+                raise UmasNoDictionary(
+                    f"PLC application {project or '(unnamed)'!r} has no embedded data dictionary. "
+                    "In Control Expert enable Tools > Project Settings > General > PLC embedded data > "
+                    "Data dictionary, then rebuild and download; the connection resumes by itself "
+                    "after the download.") from None
             self._set_state("loading dictionary")
             t = time.time()
             types = await c.read_datatypes()

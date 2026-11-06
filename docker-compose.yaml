@@ -5,8 +5,7 @@
 # Packaged deployment (new machine, no Traefik yet) - starts Traefik and the simulator:
 #   docker compose --profile traefik up -d --build
 #
-# Machine that already runs Traefik on the "proxy" network with an "opcua" entrypoint
-# (e.g. /home/scada/Documents/docker-compose_traefik.yaml) - simulator only:
+# Machine that already runs Traefik on the "proxy" network with an "opcua" entrypoint - simulator only:
 #   docker compose up -d --build
 name: opcua-sim
 

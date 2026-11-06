@@ -89,7 +89,7 @@ function timeStr(ts) {
 // ------------------------------------------------------------------ status
 const PLC_STATE = {
   connecting: "connecting…", "loading dictionary": "reading data dictionary…",
-  connected: "connected", disconnected: "disconnected",
+  connected: "connected", disconnected: "disconnected", "no dictionary": "no data dictionary",
 };
 
 async function refreshStatus() {
@@ -116,10 +116,13 @@ async function refreshStatus() {
     $("busy").hidden = true;
   }
   if (plcMode) {
-    $("emptyTitle").textContent = s.plc.state === "disconnected" ? "PLC not connected" : "Connecting to the PLC…";
-    $("emptyText").textContent = s.plc.state === "disconnected"
+    const st = s.plc.state;
+    $("emptyTitle").textContent = st === "disconnected" ? "PLC not connected"
+      : st === "no dictionary" ? "PLC has no data dictionary" : "Connecting to the PLC…";
+    $("emptyText").textContent = st === "disconnected"
       ? `${s.plc.host}:${s.plc.port} — ${s.plc.error || "retrying"}. Retrying automatically.`
-      : `${s.plc.host}:${s.plc.port} — ${PLC_STATE[s.plc.state] || s.plc.state}`;
+      : st === "no dictionary" ? `${s.plc.host}:${s.plc.port} — ${s.plc.error}`
+      : `${s.plc.host}:${s.plc.port} — ${PLC_STATE[st] || st}`;
   } else {
     $("emptyTitle").textContent = "Load a Control Expert program";
     $("emptyText").innerHTML = "Drop a <b>.ZEF</b> or <b>.XEF</b> export here, or use <b>Load program</b>.<br>" +

@@ -83,7 +83,10 @@ cycle) and the cycle stretches accordingly. The tooltip shows the breakdown (sub
 web UI).
 
 The PLC project must have **Project Settings › PLC embedded data › Data dictionary** enabled.
-With "HMI variables only" set, the dictionary holds exactly the HMI-flagged variables.
+With "HMI variables only" set, the dictionary holds exactly the HMI-flagged variables. Without it
+the PLC has no dictionary memory block (UMAS block 0x30) and rejects dictionary requests. The PLC
+state is then `no dictionary`: the connection stays open, the application CRC is checked every
+5 s, and the tags are read as soon as an application with a dictionary is downloaded.
 
 **Writes.** Without a comments file every tag is writable, like a standard OPC UA server. An OPC
 UA or web UI write goes to the PLC first; the node then takes the value read back from the PLC. If

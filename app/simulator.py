@@ -253,7 +253,7 @@ class Simulator:
                 await asyncio.sleep(0)
 
     def _on_plc_state(self, state: str, error: str):
-        if state == "disconnected" and self.tags:
+        if state in ("disconnected", "no dictionary") and self.tags:
             asyncio.create_task(self.opcua.mark_all(ua.StatusCodes.BadNotConnected))
         self.notify_status()
 
